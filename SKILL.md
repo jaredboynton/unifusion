@@ -6,8 +6,8 @@ description: >-
   (file:line, command output, source URLs) and verifying current versions and docs — then Opus 4.8 judges
   every response into a structured analysis (consensus, contradictions, partial coverage, unique insights,
   blind spots) and writes a final answer grounded in it. The panel scales to whatever model CLIs are
-  installed: two independent Opus 4.8 runs (opus4.8-4.8), plus GPT-5.5 via codex, Gemini 3.1 Pro via agy,
-  Kimi K2.7 via kimi, and GLM-5.2 via devin, up to opus4.8-gpt5.5-gemini3.1pro-kimi2.7-glm5.2. Saves a
+  installed: two independent Opus 4.8 runs (opus4.8-4.8), plus GPT-5.5 via codex, Gemini 3.5 Flash via agy,
+  Kimi K2.7 via kimi, and GLM-5.2 via devin, up to opus4.8-gpt5.5-gemini3.5flash-kimi2.7-glm5.2. Saves a
   timestamped provenance .md per run. Use whenever the user asks to "run it through Unifusion", says /unifusion,
   or wants a multi-model / panel / ensemble / cross-checked / higher-confidence answer with consensus and
   blind spots surfaced — even if they don't say "unifusion". Best for high-stakes research, design calls, and
@@ -44,11 +44,11 @@ driver-first (`opus4.8`) and appends one token per available external CLI:
 | Token | Panelist | Requires |
 | --- | --- | --- |
 | `-gpt5.5` | GPT-5.5 | `codex` CLI |
-| `-gemini3.1pro` | Gemini 3.1 Pro | `agy` CLI |
+| `-gemini3.5flash` | Gemini 3.5 Flash | `agy` CLI |
 | `-kimi2.7` | Kimi K2.7 | `kimi` CLI |
 | `-glm5.2` | GLM-5.2 | `devin` CLI |
 
-So the full panel is `opus4.8-gpt5.5-gemini3.1pro-kimi2.7-glm5.2` (all four CLIs present); with fewer CLIs
+So the full panel is `opus4.8-gpt5.5-gemini3.5flash-kimi2.7-glm5.2` (all four CLIs present); with fewer CLIs
 the detector emits the richest subset, and with none it falls back to `opus4.8-4.8` (the same prompt run
 twice as two independent Opus 4.8 panelists, always available).
 
@@ -142,7 +142,7 @@ the judge and must stay separate from the panelists — for `opus4.8-4.8`, both 
 subagents, not you, so your synthesis reads all answers fresh.
 
 **Graceful degradation.** If an external panelist exits non-zero, drop it, record a one-line note (e.g.
-`kimi dropped: timeout -> opus4.8-gpt5.5-gemini3.1pro-glm5.2`), and continue with what's left. The ultimate
+`kimi dropped: timeout -> opus4.8-gpt5.5-gemini3.5flash-glm5.2`), and continue with what's left. The ultimate
 fallback is `opus4.8-4.8`. Never abort because one CLI failed.
 
 ## Step 3 — Judge (pick the track that fits the task)

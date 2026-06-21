@@ -7,7 +7,7 @@
 # machine can currently support:
 #
 #   GPT-5.5        via codex   -> -gpt5.5
-#   Gemini 3.1 Pro via agy     -> -gemini3.1pro
+#   Gemini 3.5 Flash via agy     -> -gemini3.5flash
 #   Kimi K2.7      via kimi     -> -kimi2.7
 #   GLM-5.2        via devin    -> -glm5.2
 #
@@ -29,7 +29,7 @@ yn() { [ "$1" = true ] && echo yes || echo NO; }
 echo "panelist availability (Opus 4.8 is always a panelist + the judge, via Agent subagents):"
 echo "  opus4.8      : yes (Agent subagents — always available)"
 printf "  gpt5.5       : %s (codex CLI)\n"  "$(yn "$codex_ok")"
-printf "  gemini3.1pro : %s (agy CLI)\n"    "$(yn "$agy_ok")"
+printf "  gemini3.5flash : %s (agy CLI)\n"    "$(yn "$agy_ok")"
 printf "  kimi2.7      : %s (kimi CLI)\n"   "$(yn "$kimi_ok")"
 printf "  glm5.2       : %s (devin CLI)\n"  "$(yn "$devin_ok")"
 echo
@@ -37,7 +37,7 @@ echo
 slug="opus4.8"
 ext=0
 $codex_ok && { slug="$slug-gpt5.5";       ext=$((ext + 1)); }
-$agy_ok   && { slug="$slug-gemini3.1pro";  ext=$((ext + 1)); }
+$agy_ok   && { slug="$slug-gemini3.5flash";  ext=$((ext + 1)); }
 $kimi_ok  && { slug="$slug-kimi2.7";       ext=$((ext + 1)); }
 $devin_ok && { slug="$slug-glm5.2";        ext=$((ext + 1)); }
 [ "$ext" -eq 0 ] && slug="opus4.8-4.8"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_gemini.sh — run one Gemini 3.1 Pro panelist (via the `agy` / Antigravity CLI), web + bash.
+# run_gemini.sh — run one Gemini 3.5 Flash panelist (via the `agy` / Antigravity CLI), web + bash.
 #
 # Usage:
 #   run_gemini.sh <prompt_file> <output_file>
@@ -17,7 +17,7 @@
 #                       The orchestrator then drops Gemini and degrades the panel.
 #
 # Config (env):
-#   AGY_MODEL            model name (default "Gemini 3.1 Pro (High)"; see `agy models`).
+#   AGY_MODEL            model name (default "Gemini 3.5 Flash (High)"; see `agy models`).
 #   UNIFUSION_AGY_NO_MODEL  set to 1 to omit --model and use agy's configured default
 #                        (escape hatch if --model ever hangs in print mode).
 #   UNIFUSION_TIMEOUT       per-panelist budget in seconds (default 300, from _unifusion_lib.sh).
@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 prompt_file="${1:?usage: run_gemini.sh <prompt_file> <output_file>}"
 output_file="${2:?usage: run_gemini.sh <prompt_file> <output_file>}"
 
-AGY_MODEL="${AGY_MODEL:-Gemini 3.1 Pro (High)}"
+AGY_MODEL="${AGY_MODEL:-Gemini 3.5 Flash (High)}"
 BRAIN_DIR="$HOME/.gemini/antigravity-cli/brain"
 # agy's own print-mode deadline (Go duration); keep the external backstop a bit longer
 # so agy stops itself cleanly first.

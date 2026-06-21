@@ -29,7 +29,7 @@ Panel composition scales to whatever is installed, one panelist per CLI:
 |---|---|---|
 | *(built-in)* | Opus 4.8 (Agent subagents) | `opus4.8` |
 | `codex` | GPT-5.5 | `-gpt5.5` |
-| `agy` | Gemini 3.1 Pro | `-gemini3.1pro` |
+| `agy` | Gemini 3.5 Flash | `-gemini3.5flash` |
 | `kimi` | Kimi K2.7 | `-kimi2.7` |
 | `devin` | GLM-5.2 | `-glm5.2` |
 

@@ -43,12 +43,12 @@ rules above still hold: panelists never see each other's answers, and the task i
 - `opus4.8-4.8` — the **same prompt run twice** as two independent Opus 4.8 panelists (Agent subagents),
   then judged. Same model, two cold runs.
 - `opus4.8-gpt5.5` — Opus 4.8 and GPT-5.5 (codex) answer **in parallel**, then judged.
-- `opus4.8-gpt5.5-gemini3.1pro` — Opus 4.8, GPT-5.5, and Gemini 3.1 Pro answer in parallel, then judged.
-- `opus4.8-gpt5.5-gemini3.1pro-kimi2.7-glm5.2` — the full panel: Opus 4.8, GPT-5.5 (codex), Gemini 3.1
+- `opus4.8-gpt5.5-gemini3.5flash` — Opus 4.8, GPT-5.5, and Gemini 3.5 Flash answer in parallel, then judged.
+- `opus4.8-gpt5.5-gemini3.5flash-kimi2.7-glm5.2` — the full panel: Opus 4.8, GPT-5.5 (codex), Gemini 3.1
   Pro (agy), Kimi K2.7 (kimi), and GLM-5.2 (devin) answer in parallel, then judged.
 
 `detect_panel.sh` recommends the richest panel the machine supports, appending one token per available
-external CLI (`-gpt5.5` codex, `-gemini3.1pro` agy, `-kimi2.7` kimi, `-glm5.2` devin) and falling back to
+external CLI (`-gpt5.5` codex, `-gemini3.5flash` agy, `-kimi2.7` kimi, `-glm5.2` devin) and falling back to
 `opus4.8-4.8` when none is present. A missing or failing CLI drops only its own panelist; the rest of the
 panel continues.
 

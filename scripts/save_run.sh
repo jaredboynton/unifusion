@@ -4,7 +4,7 @@
 # Usage:
 #   save_run.sh <slug> <question_file> <analysis_file> <final_file> [LABEL=path ...]
 #
-# - <slug>           : the panel slug actually run (e.g. opus4.8-gpt5.5-gemini3.1pro)
+# - <slug>           : the panel slug actually run (e.g. opus4.8-gpt5.5-gemini3.5flash)
 # - <question_file>  : the user's question, verbatim
 # - <analysis_file>  : the judge's 5-section structured analysis
 # - <final_file>     : the grounded final answer

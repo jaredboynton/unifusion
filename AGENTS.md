@@ -38,7 +38,7 @@ Plain bash + two interpreter helpers; no build step.
   and Devin transcripts all summarize end-to-end. Writes a bundle to `--out-dir`; the brief is
   `<out-dir>/summary.md`. Vendored from claudecompact-patcher; keep the four provider dispatch paths in sync
   if edited.
-- `scripts/run_codex.sh` (GPT-5.5), `run_gemini.sh` (Gemini 3.1 Pro via `agy`), `run_kimi.sh` (Kimi K2.7),
+- `scripts/run_codex.sh` (GPT-5.5), `run_gemini.sh` (Gemini 3.5 Flash via `agy`), `run_kimi.sh` (Kimi K2.7),
   `run_devin.sh` (GLM-5.2) — one external panelist each.
 - `scripts/_unifusion_lib.sh` — sourced by the runners; `have()` and `_run_with_timeout` (perl fork+alarm,
   since stock macOS has no `timeout`/`gtimeout`). `UNIFUSION_TIMEOUT` default 300s.
@@ -70,7 +70,7 @@ Plain bash + two interpreter helpers; no build step.
 | `UNIFUSION_TIMEOUT` | `300` | per-panelist deadline (seconds) |
 | `KIMI_MODEL` | `kimi-code/kimi-for-coding` | Kimi model id |
 | `DEVIN_MODEL` | (unset → devin config `glm-5-2`) | override GLM model |
-| `AGY_MODEL` | `Gemini 3.1 Pro (High)` | agy model name |
+| `AGY_MODEL` | `Gemini 3.5 Flash (High)` | agy model name |
 | `UNIFUSION_AGY_NO_MODEL` | (unset) | omit `--model`, use agy default |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | (unset) | enables the (gemini) session-context brief |
 | `UNIFUSION_CONTEXT_PROVIDER` | `gemini` | summarizer provider (`codex`/`xai`/`mantle` also valid) |

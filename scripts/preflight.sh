@@ -38,7 +38,7 @@ reminder() {
   fi
 }
 reminder codex "codex (GPT-5.5)     "
-reminder agy   "agy   (Gemini 3.1Pro)"
+reminder agy   "agy   (Gemini 3.5Flash)"
 reminder kimi  "kimi  (Kimi K2.7)   "
 reminder devin "devin (GLM-5.2)     "
 
