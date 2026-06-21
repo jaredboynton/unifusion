@@ -1,0 +1,16 @@
+# local tooling state (not portable)
+.unifable/
+.omc/
+
+# session transcripts and scratch copies (never source)
+*.jsonl
+
+# macOS
+.DS_Store
+
+# tooling
+node_modules/
+
+# local run scratch
+*.tmp
+*.out
