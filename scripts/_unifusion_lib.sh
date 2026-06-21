@@ -18,18 +18,23 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # _run_with_timeout SECONDS cmd [args...]
 # Exit status = the command's own status, or 124 if it was killed for timing out.
+# Child runs in its own process group so timeout/signals reap the whole subtree.
 _run_with_timeout() {
   local secs="$1"; shift
-  # cleanup-traps: ok -- the child is killed via the embedded perl $SIG{ALRM,TERM,INT}
-  # handlers below (on deadline, and if this wrapper is itself signaled), so no orphan leaks.
   perl -e '
+    use POSIX ();
     my $secs = shift @ARGV;
     my $pid = fork();
     exit 127 unless defined $pid;
-    if ($pid == 0) { exec @ARGV or exit 127; }   # child: become the real command
-    my $reap = sub { kill "TERM", $pid; sleep 2; kill "KILL", $pid; };
-    local $SIG{ALRM} = $reap;                          # deadline => terminate the child
-    local $SIG{TERM} = sub { $reap->(); exit 143; };   # wrapper killed => take the child with us
+    if ($pid == 0) { POSIX::setpgid(0, 0); exec @ARGV or exit 127; }  # child: own pgroup, become the command
+    POSIX::setpgid($pid, $pid);                                       # race-proof: set it from the parent too
+    my $reap = sub {
+      kill("TERM", -$pid); kill("TERM", $pid);   # negative pid => the whole process group
+      sleep 2;
+      kill("KILL", -$pid); kill("KILL", $pid);
+    };
+    local $SIG{ALRM} = $reap;                          # deadline => terminate the child group
+    local $SIG{TERM} = sub { $reap->(); exit 143; };   # wrapper killed => take the group with us
     local $SIG{INT}  = sub { $reap->(); exit 130; };
     alarm $secs;
     waitpid($pid, 0);
