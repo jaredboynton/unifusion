@@ -15,6 +15,7 @@
 # - `--dangerously-bypass-approvals-and-sandbox` intentionally gives the panelist the same local tool
 #   access as a normal trusted Codex CLI run. This is needed for macOS keychain-backed tools like `gh`.
 # - `-c tools.web_search=true` enables the web search tool.
+# - Runs under an isolated CODEX_HOME (minimal config.toml + copied auth.json).
 # - The throwaway copy is deleted when the panelist exits.
 # - There is no `timeout`/`gtimeout` on stock macOS, so the codex run is wrapped in a self-contained
 #   perl timeout helper (UNIFUSION_TIMEOUT, default 300s — see _unifusion_lib.sh). On timeout the runner
@@ -85,13 +86,28 @@ if command -v gh >/dev/null 2>&1; then
   fi
 fi
 
-_run_with_timeout "$UNIFUSION_TIMEOUT" codex exec \
+codex_home="$scratch/codexhome"
+mkdir -p "$codex_home"
+for f in auth.json auth-2.json; do
+  [ -f "$HOME/.codex/$f" ] && cp "$HOME/.codex/$f" "$codex_home/" 2>/dev/null
+done
+codex_model="${UNIFUSION_CODEX_MODEL:-gpt-5.5}"
+cat > "$codex_home/config.toml" <<EOF
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+suppress_unstable_features_warning = true
+include_apps_instructions = false
+personality = "none"
+model = "$codex_model"
+model_reasoning_effort = "$effort"
+EOF
+
+CODEX_HOME="$codex_home" _run_with_timeout "$UNIFUSION_TIMEOUT" codex exec \
   --skip-git-repo-check \
   --ephemeral \
   --cd "$panel_cwd" \
   --dangerously-bypass-approvals-and-sandbox \
   -c tools.web_search=true \
-  -c "model_reasoning_effort=$effort" \
   -o "$output_file" \
   - < "$prompt_file" \
   > "$scratch/stream.log" 2>&1

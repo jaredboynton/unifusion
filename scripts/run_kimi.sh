@@ -17,7 +17,8 @@
 #   the first line plus a uniform 2-space hanging indent on every line; genuine list items use
 #   "- ". The capture below removes the leading bullet, the 2-space indent, and any ANSI, which
 #   leaves real Markdown (including "- " lists) intact.
-# - Model alias `kimi-code/kimi-for-coding` is "K2.7 Code" (override with KIMI_MODEL).
+# - Model alias `kimi-k2.7-code-highspeed` is the default (override with KIMI_MODEL).
+# - `--skills-dir <empty>` skips auto-discovered skills.
 # - The panelist runs against a throwaway copy of the current repo/workdir, so its file writes do
 #   not touch your live checkout, while still letting it inspect the repo for codebase evidence.
 # - macOS has no `timeout`; the run is wrapped in the perl helper from _unifusion_lib.sh
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 prompt_file="${1:?usage: run_kimi.sh <prompt_file> <output_file>}"
 output_file="${2:?usage: run_kimi.sh <prompt_file> <output_file>}"
-KIMI_MODEL="${KIMI_MODEL:-kimi-code/kimi-for-coding}"
+KIMI_MODEL="${KIMI_MODEL:-kimi-k2.7-code-highspeed}"
 
 case "$prompt_file" in
   /*) ;;
@@ -85,10 +86,25 @@ if [ -n "$source_subdir" ]; then
   panel_cwd="$workdir/$source_subdir"
 fi
 
+empty_skills="$scratch/noskills"
+mkdir -p "$empty_skills"
+
+kimi_pids_before="$(pgrep -f kimi-code 2>/dev/null | sort -u)"
+
 ( cd "$panel_cwd" && _run_with_timeout "$UNIFUSION_TIMEOUT" \
-    kimi -p "$(cat "$prompt_file")" --output-format text -m "$KIMI_MODEL" ) \
+    kimi -p "$(cat "$prompt_file")" --output-format text --skills-dir "$empty_skills" -m "$KIMI_MODEL" ) \
   > "$scratch/raw.out" 2> "$scratch/stream.log"
 status=$?
+
+kimi_pids_after="$(pgrep -f kimi-code 2>/dev/null | sort -u)"
+kimi_new="$(comm -13 <(printf '%s\n' "$kimi_pids_before") <(printf '%s\n' "$kimi_pids_after") 2>/dev/null | tr -d ' ')"
+if [ -n "$kimi_new" ]; then
+  # shellcheck disable=SC2086
+  kill $kimi_new 2>/dev/null
+  sleep 1
+  # shellcheck disable=SC2086
+  kill -9 $kimi_new 2>/dev/null
+fi
 
 # Clean capture: strip ANSI, remove the leading "• " wrapper bullet and the uniform 2-space
 # hanging indent (per line), drop residual control bytes (keep tab + newline).

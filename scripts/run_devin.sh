@@ -12,11 +12,8 @@
 #   sidesteps argument-length and shell-quoting limits.
 # - `--permission-mode dangerous` auto-approves every tool, so web search and bash both run.
 #   Devin's web search is native and needs no extra flag.
-# - The model is GLM-5.2: `~/.config/devin/config.json` already pins `agent.model = "glm-5-2"`,
-#   so print mode inherits it. Override with DEVIN_MODEL to pass an explicit `--model`.
-# - In print mode devin writes only its final answer to stdout; the user config's fablize hooks do
-#   not emit to stdout, so no isolation config is needed. A defensive ANSI/control strip is still
-#   applied to the capture.
+# - `--config <throwaway>` uses a minimal config derived from ~/.config/devin/config.json.
+#   Model is GLM-5.2 (override with DEVIN_MODEL).
 # - The panelist runs against a throwaway copy of the current repo/workdir, so its file writes do
 #   not touch your live checkout, while still letting it inspect the repo for codebase evidence.
 # - macOS has no `timeout`; the run is wrapped in the perl helper from _unifusion_lib.sh
@@ -30,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 prompt_file="${1:?usage: run_devin.sh <prompt_file> <output_file>}"
 output_file="${2:?usage: run_devin.sh <prompt_file> <output_file>}"
-DEVIN_MODEL="${DEVIN_MODEL:-}"
+DEVIN_MODEL="${DEVIN_MODEL:-glm-5.2}"
 
 case "$prompt_file" in
   /*) ;;
@@ -84,10 +81,28 @@ if [ -n "$source_subdir" ]; then
   panel_cwd="$workdir/$source_subdir"
 fi
 
-devin_args=( --print --prompt-file "$prompt_file" --permission-mode dangerous )
-if [ -n "$DEVIN_MODEL" ]; then
-  devin_args+=( --model "$DEVIN_MODEL" )
+devin_config="$scratch/devin_min.json"
+real_config="${DEVIN_CONFIG:-$HOME/.config/devin/config.json}"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$real_config" "$devin_config" "$DEVIN_MODEL" <<'PY' || printf '{"agent":{"model":"%s"}}' "$DEVIN_MODEL" > "$devin_config"
+import json, sys
+src, dst, model = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    d = json.load(open(src))
+except Exception:
+    d = {}
+for k in ("hooks", "plugins", "rules", "skills"):
+    d.pop(k, None)
+d.setdefault("agent", {})["model"] = model
+d["skip_workspace_trust"] = True
+d["skip_home_directory_warning"] = True
+json.dump(d, open(dst, "w"))
+PY
+else
+  printf '{"agent":{"model":"%s"},"skip_workspace_trust":true,"skip_home_directory_warning":true}' "$DEVIN_MODEL" > "$devin_config"
 fi
+
+devin_args=( --config "$devin_config" --print --prompt-file "$prompt_file" --permission-mode dangerous )
 
 ( cd "$panel_cwd" && _run_with_timeout "$UNIFUSION_TIMEOUT" devin "${devin_args[@]}" ) \
   > "$scratch/raw.out" 2> "$scratch/stream.log"

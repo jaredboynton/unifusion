@@ -2,14 +2,17 @@
 # save_run.sh — write the provenance .md for one Unifusion run, on the INTERNAL disk only.
 #
 # Usage:
+#   save_run.sh <slug> <question_file> <analysis_file> <final_file> <run_dir>
 #   save_run.sh <slug> <question_file> <analysis_file> <final_file> [LABEL=path ...]
 #
 # - <slug>           : the panel slug actually run (e.g. opus4.8-gpt5.5-gemini3.5flash)
 # - <question_file>  : the user's question, verbatim
 # - <analysis_file>  : the judge's 5-section structured analysis
 # - <final_file>     : the grounded final answer
-# - LABEL=path       : one per panelist, raw answer file (e.g. "opus-A=/tmp/..._opusA.md",
-#                      "gpt5.5=/tmp/unifusion_codex_out.md", "gemini=/tmp/unifusion_gemini_out.md")
+# - <run_dir>        : the unifusion.sh run dir — raw panelist answers (*_out.md) are auto-discovered
+#                      from it (the simple path). Pass a single directory here.
+# - LABEL=path       : OR list them explicitly, one per panelist, raw answer file (e.g.
+#                      "opus-A=/tmp/..._opusA.md", "gpt5.5=/tmp/unifusion_codex_out.md")
 #
 # Optional env:
 #   UNIFUSION_PANEL_NOTE   degradation note (e.g. "gemini dropped: agy empty -> opus4.8-gpt5.5")
@@ -27,6 +30,28 @@ question_file="${2:?need question_file}"
 analysis_file="${3:?need analysis_file}"
 final_file="${4:?need final_file}"
 shift 4
+
+# Auto-discover mode: a single directory argument => map its *_out.md files to labels.
+if [ "$#" -eq 1 ] && [ -d "$1" ]; then
+  run_dir="$1"; shift
+  label_for() {
+    case "$1" in
+      cb_out)     echo "opus-A" ;;
+      cb_out_b)   echo "opus-B" ;;
+      codex_out)  echo "gpt5.5" ;;
+      gemini_out) echo "gemini3.5flash" ;;
+      kimi_out)   echo "kimi2.7" ;;
+      devin_out)  echo "glm5.2" ;;
+      *)          echo "$1" ;;
+    esac
+  }
+  set --
+  for f in "$run_dir"/*_out.md; do
+    [ -e "$f" ] || continue
+    stem="$(basename "$f" .md)"
+    set -- "$@" "$(label_for "$stem")=$f"
+  done
+fi
 
 RUNS_DIR="$HOME/.claude/unifusion-runs"
 mkdir -p "$RUNS_DIR"
