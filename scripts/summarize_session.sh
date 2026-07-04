@@ -24,6 +24,8 @@
 #   UNIFUSION_CONTEXT_PROVIDER   summarizer provider (default gemini; also codex/xai/mantle)
 #   GEMINI_API_KEY / GOOGLE_API_KEY   required for the default gemini provider
 #   plus the COMPACT_*/GEMINI_* knobs read by compact-full-transcript.mjs
+#   UNIFUSION_COMPACT_TRANSCRIPT_RENDERER (e.g. sentinel), UNIFUSION_COMPACT_TOOL_OUTPUT_STRATEGY (headtail|dspc|mask),
+#   UNIFUSION_COMPACT_TOOL_OUTPUT_KEEP_RECENT (default 64 in patchpress)
 
 set -uo pipefail
 
@@ -75,6 +77,16 @@ errlog="$(mktemp "${TMPDIR:-/tmp}/unifusion-summarize.XXXXXX")"
 # Schema-constrained structured output on the resolved transcript.
 # CODEX_CLIENT_VERSION / CODEX_USER_AGENT are pre-set so the engine's module-load shell-outs
 # (codex --version, sw_vers) are skipped — the summarizer never depends on the codex CLI.
+COMPACT_RENDERER_ARGS=()
+if [ -n "${UNIFUSION_COMPACT_TRANSCRIPT_RENDERER:-}" ]; then
+  COMPACT_RENDERER_ARGS+=(--transcript-renderer "$UNIFUSION_COMPACT_TRANSCRIPT_RENDERER")
+fi
+if [ -n "${UNIFUSION_COMPACT_TOOL_OUTPUT_STRATEGY:-}" ]; then
+  COMPACT_RENDERER_ARGS+=(--tool-output-compress-strategy "$UNIFUSION_COMPACT_TOOL_OUTPUT_STRATEGY")
+fi
+if [ -n "${UNIFUSION_COMPACT_TOOL_OUTPUT_KEEP_RECENT:-}" ]; then
+  COMPACT_RENDERER_ARGS+=(--sentinel-tool-output-keep-recent "$UNIFUSION_COMPACT_TOOL_OUTPUT_KEEP_RECENT")
+fi
 CODEX_CLIENT_VERSION="${CODEX_CLIENT_VERSION:-0.0.0}" \
 CODEX_USER_AGENT="${CODEX_USER_AGENT:-unifusion-summarizer}" \
 node "$SCRIPT_DIR/compact-full-transcript.mjs" \
@@ -83,6 +95,7 @@ node "$SCRIPT_DIR/compact-full-transcript.mjs" \
   --out-dir "$outdir" \
   --no-live-output \
   --summary-instructions "$instructions" \
+  "${COMPACT_RENDERER_ARGS[@]}" \
   >/dev/null 2>"$errlog"
 rc=$?
 

@@ -1,162 +1,46 @@
 # unifusion
 
-**Ask several frontier models the same hard question at once, let each work it alone, then have Opus 4.8
-read every answer and synthesize one grounded reply.** A Claude Code skill: Opus 4.8 is always the driver
-and the judge; every other model is an optional panelist that joins if its CLI is on `PATH`.
+**Run a Fable orchestrator that dispatches frontier panelists in parallel, then synthesizes one
+evidence-backed recommendation.**
 
-unifusion is a panel-and-synthesis harness in the **Fable / unifable** family — the same "verification as
-procedure" instinct, applied across a panel of models. The whole bet
-is **independence**: a panel only helps to the degree its members fail *differently*, so unifusion fans out
-blind, passes the task verbatim, and lets the judge discount agreement that just echoes a shared prior.
+Unifusion is an **OpenCode orchestrator harness** in the unifable family. `scripts/unifusion.sh` starts
+one `opencode serve` daemon, runs a single `unifusion-orchestrator` thread (Fable on Bedrock global), and
+captures the synthesized `[FINAL]` / `[ANALYSIS]` plus panelist reports from `task` tool events.
 
-## What it does
+## Active flow
 
-The orchestrator (Opus 4.8) runs **one script** — `scripts/unifusion.sh` — which drives the whole panel;
-the remaining stages are small, replaceable scripts under `scripts/`. `SKILL.md` is the entry point the
-model executes.
-
-| Stage | Script | Role |
+| Stage | Artifact | Role |
 |---|---|---|
-| Run the panel | `unifusion.sh` | auto-detect installed CLIs, build the brief, assemble the shared prompt, fan **every** available panelist out in parallel + blind + clean-room, print a manifest |
-| Brief *(auto)* | `resolve_session.sh` → `summarize_session.sh` → `compact-full-transcript.mjs` | resolve **this** session's transcript host-agnostically, summarize it to a **factual-only** brief shared identically by every panelist |
-| Fan out | `run_cb.sh`, `run_codex.sh`, `run_gemini.sh`, `run_kimi.sh`, `run_devin.sh` | every model answers the **same** prompt in parallel, blind, with web + bash, citing real evidence |
-| Judge | `references/judge_rubric.md` | Opus 4.8 **merges** (Track A, code) or **synthesizes** (Track B, five sections) |
-| Save | `save_run.sh` | timestamped provenance under `~/.claude/unifusion-runs/` (auto-discovers the run dir) |
+| Resolve brief | `resolve_session.sh` -> `summarize_session.sh` | factual-only session context |
+| Build prompt | `scripts/unifusion.sh` | orchestrator prompt with context + verbatim task |
+| Serve | `opencode serve` (skill-local `opencode/opencode.json`) | one warm headless daemon |
+| Orchestrate | `unifusion-orchestrator` attach thread | strategy, parallel `task` dispatch, synthesis |
+| Panelists | `panelist-*` subagents via `task` | tailored frontier-research reports |
+| Save | `save_run.sh` | provenance under `~/.unifable/unifusion-runs/` |
 
-Panel composition scales to whatever is installed, one panelist per CLI:
+## Active agents
 
-| CLI | Panelist | Slug token |
+| Agent | Backing model | Role |
 |---|---|---|
-| `cb` | Opus 4.8 (Claude/Bedrock, `--safe-mode`) | `opus4.8` |
-| `codex` | GPT-5.5 | `-gpt5.5` |
-| `agy` | Gemini 3.5 Flash | `-gemini3.5flash` |
-| `kimi` | Kimi K2.7 | `-kimi2.7` |
-| `devin` | GLM-5.2 | `-glm5.2` |
+| `unifusion-orchestrator` | Fable 5 (`amazon-bedrock/global.anthropic.claude-fable-5`) | strategy, dispatch, synthesis |
+| `panelist-gpt` | GPT-5.5 (`openai-ws/gpt-5.5`) | frontier research |
+| `panelist-grok` | Grok 4.3 (`amazon-bedrock/xai.grok-4.3`) | frontier research |
+| `panelist-glm` | GLM-5.2 (`zai-coding-plan/glm-5.2`) | frontier research |
+| `panelist-kimi` | Kimi K2.7 (`kimi-for-coding/k2p7`) | frontier research |
 
-With no external CLI present, unifusion still runs as `opus4.8-4.8` — two independent Opus passes, judged.
-
-Every panelist runs **clean-room** — its plugins, hooks, MCP servers, and skills stripped (`cb --safe-mode`,
-an isolated `CODEX_HOME`, a minimal devin config, an empty kimi skills dir) — so the unifable harness (e.g.
-the groundedness breaker that would block a panelist's tools in a loop) or a slow MCP server can never stall
-or correlate the panel.
-
-## Independence is the mechanism
-
-The scripts enforce what makes a panel work, so the orchestrator cannot accidentally undo it:
-
-- **Blind.** Panelists never see each other's work. The judge is the only place the answers meet.
-- **Verbatim.** The user's task is passed **unmodified**; the orchestrator is forbidden from pre-digesting
-  or summarizing the question.
-- **No personas.** No "skeptic / optimizer" lenses — those bias every member the same way. Diversity comes
-  for free from running the same prompt cold across different systems.
-- **The judge is separate.** Panelists run as separate processes (the `cb` Opus runs and the external
-  CLIs); the orchestrator session that judges is never one of them and they can't call back out to spawn it,
-  so the pipeline only flows one way (panel → judge). Opus reads the answers fresh, with none of its own to
-  defend.
-- **The one shared prior is bounded.** The optional session brief is identical for every panelist, carries
-  **state only** (goals, decisions, files, constraints) with no proposed approach, and the judge treats
-  agreement that merely restates it as a shared input, giving independently-reached agreement more weight.
-
-## Session-transcript resolution
-
-The session brief exists so panelists can answer questions that depend on what the session already
-established. Building it means answering one deceptively hard question: *which transcript is "this
-session"?* Different host CLIs store transcripts differently and most expose no session id. So
-`resolve_session.sh` is host-agnostic:
-
-1. **Detect the host by process ancestry** — walk `$$` → PID 1 reading `comm`/argv, classify the nearest
-   agent ancestor as `claude | codex | droid | devin`.
-2. **Resolve id → transcript path** per host (Claude `CLAUDE_CODE_SESSION_ID` / `--resume` →
-   `~/.claude/projects/**/<id>.jsonl`; Codex `CODEX_THREAD_ID` → `~/.codex/sessions/**/rollout-*-<id>.jsonl`;
-   Droid argv uuid → `~/.factory/sessions/<slug>/<id>.jsonl`; Devin `devin list --format json` scoped to the
-   host cwd → `~/.local/share/devin/cli/transcripts/<id>.json`).
-3. **Fingerprint-verify** — match the verbatim question (written to `/tmp/unifusion_question.txt`) with
-   `grep -lF` to disambiguate cwd candidates and confirm the pick.
-4. **Fail closed** — resolution must be a deterministic id or a unique fingerprint match, else exit non-zero
-   and skip the brief. There is no newest-by-mtime guess; a wrong transcript would poison every panelist.
-
-`compact-full-transcript.mjs` then summarizes the resolved transcript with **schema-constrained structured
-output** (gemini-3.5-flash by default). Two foreign-format adapters feed its native-Claude pipeline —
-`codexPayloadText` for Codex `.payload` records and `atifToClaudeJsonl` for Devin ATIF-v1.4 JSON — so all
-four hosts summarize end-to-end. A content guard fails closed before any API call if a transcript yields no
-citable text.
-
-## Why a panel beats one model
-
-The literature is consistent, and unifusion is built around the parts that hold up.
-
-- **Panels of models beat the best single model.** Mixture-of-Agents (proposers feeding an aggregator) set
-  state-of-the-art on AlpacaEval 2.0, MT-Bench and FLASK
-  ([Wang et al., 2024](https://arxiv.org/abs/2406.04692)); a **diversity-aware** ensemble lands **+17 points**
-  over the best single model on MMLU-Pro ([DFPE, EACL 2026](https://aclanthology.org/2026.findings-eacl.282/));
-  multi-agent debate improves factuality and math
-  ([Du et al., ICML 2024](https://composable-models.github.io/llm_debate/)). The gains track how
-  *differently* the members reason.
-- **It's the same lever frontier models use.** Test-time scaling — sample in parallel, then aggregate — is
-  now a standard reasoning method with a full taxonomy
-  ([Zhang et al., 2025](https://arxiv.org/abs/2503.24235)). unifusion does it across genuinely different
-  model families.
-- **Correlated errors are the failure mode.** Nine frontier judges were measured to carry only about **two**
-  independent votes' worth of information, ~3/4 of the apparent independence lost to shared mistakes
-  ([Nine Judges, Two Effective Votes, 2026](https://arxiv.org/abs/2605.29800)). Hence: blind fan-out,
-  verbatim task, judge discounts echoed agreement.
-- **Synthesis beats voting.** Majority vote discards the minority-correct answer; a learned aggregator beats
-  it by recovering exactly those answers
-  ([The Majority is not always right, 2025](https://arxiv.org/abs/2509.06870)). unifusion's judge weights
-  whoever ran the code or cited the primary source.
-
-One honest nuance: mixing models is not automatically better than running your single best model several
-times — Self-MoA wins when one model dominates
-([Rethinking Mixture-of-Agents, 2025](https://arxiv.org/abs/2502.00674)). That is exactly the `opus4.8-4.8`
-fallback: two cold Opus runs, judged.
-
-## Install
-
-Drop this directory at `~/.agents/skills/unifusion/` (Claude Code's skills home; `~/.claude/skills` may
-symlink there). The Opus panelist needs the `cb` CLI (Claude in Bedrock mode) on `PATH`; the other panelists
-are added automatically when their CLI is on `PATH` (see the CLI table above). The optional session brief
-needs Node and a `GEMINI_API_KEY` (or `GOOGLE_API_KEY`); without them it is skipped.
-
-## Use
-
-Just ask: "run this through unifusion", `/unifusion`, or "get me a multi-model panel on X". There is nothing
-to configure — it always uses every model CLI installed. A missing CLI drops only its own panelist; the run
-never aborts over it.
-
-## Verify
-
-The release self-check is a single failable gate:
+## Entry point
 
 ```bash
-bash scripts/selfcheck.sh        # syntax, resolver identity + sha, content guard,
-                                 # multi-provider, ATIF + Codex ingest, git hygiene
+bash scripts/unifusion.sh /tmp/unifusion_question.txt
 ```
 
-It exits non-zero on any failure and runs no paid API calls.
+The script prints `RUN_DIR`, `ORCH_PROMPT`, `ANALYSIS`, `FINAL`, `DELIVERABLE`, `PROVENANCE`, and one
+`PANELIST` line per slug.
 
-## Cost
+## Notes
 
-Roughly N× a single answer in tokens, and as slow as the slowest panelist. That is the trade: you spend more
-to stop being confidently wrong in the places where being wrong is what costs you.
-
-## Layout
-
-```
-unifusion/
-  SKILL.md              the run, step by step (what the model follows)
-  AGENTS.md             maintainer notes (scripts, runner contract, safe-change rules)
-  references/
-    panel.md            panel composition + the independence rules
-    judge_rubric.md     the two judge tracks (merge code / synthesize research)
-  scripts/              unifusion.sh (entrypoint), resolver + summarizer, run_* panelists (cb/codex/agy/kimi/devin), save_run, helpers
-```
-
-## Sources
-
-- Mixture-of-Agents Enhances Large Language Model Capabilities — Wang et al., 2024 — https://arxiv.org/abs/2406.04692
-- DFPE: A Diverse Fingerprint Ensemble for Enhancing LLM Performance — ACL Findings (EACL) 2026 — https://aclanthology.org/2026.findings-eacl.282/
-- Improving Factuality and Reasoning in Language Models through Multiagent Debate — Du et al., ICML 2024 — https://composable-models.github.io/llm_debate/
-- A Survey on Test-Time Scaling in Large Language Models — Zhang et al., 2025 — https://arxiv.org/abs/2503.24235
-- Nine Judges, Two Effective Votes: Correlated Errors Undermine LLM Evaluation Panels — 2026 — https://arxiv.org/abs/2605.29800
-- The Majority is not always right: RL training for solution aggregation — 2025 — https://arxiv.org/abs/2509.06870
-- Rethinking Mixture-of-Agents: Is Mixing Different LLMs Beneficial? (Self-MoA) — 2025 — https://arxiv.org/abs/2502.00674
+- Orchestrator dispatches all panelists in **one turn** for parallel `task` execution.
+- Panelists receive **tailored assignments** from the orchestrator (not identical verbatim prompts).
+- Session brief is factual only; user task is verbatim in the orchestrator prompt.
+- `UNIFUSION_ORCH_TIMEOUT` defaults to 1500s (no per-panelist shell timeout).
+- Archived: `scripts/archive/unifusion_droid.sh`, `scripts/archive/unifusion_parallel_cli.sh`.

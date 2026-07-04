@@ -61,7 +61,8 @@ for _ in $(seq 1 40); do
   argv="$(ps -o command= -p "$pid" 2>/dev/null)"
   h=""
   case "$comm" in
-    *claude) h=claude ;; *codex) h=codex ;; *droid) h=droid ;; *devin) h=devin ;;
+    *claude) h=claude ;; *codex) h=codex ;; *droid) h=droid ;;
+    *devin) h=devin ;; *glm-acp-agent|*glm-acp) h=glm ;;
   esac
   if [ -z "$h" ]; then
     case "$argv" in
@@ -129,6 +130,12 @@ print(rows[0]["id"] if rows else "")
     [ -n "$id" ] && method="devin-list"
     [ -n "$id" ] && [ -f "$tdir/$id.json" ] && path="$tdir/$id.json"
     shopt -s nullglob; candidates=("$tdir"/*.json); shopt -u nullglob
+    ;;
+  glm)
+    gdir="${ACP_GLM_SESSION_DIR:-$HOME/.local/state/glm-acp-agent/sessions}"
+    # glm-acp-agent persists sessions as JSON files keyed by sessionId, each containing
+    # cwd + updatedAt metadata. No list command, so fingerprint is the only selector.
+    shopt -s nullglob; candidates=("$gdir"/*.json); shopt -u nullglob
     ;;
 esac
 

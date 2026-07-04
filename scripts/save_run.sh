@@ -20,8 +20,9 @@
 #   UNIFUSION_CONTEXT_FILE the injected session-context brief (recorded so the run is reproducible and
 #                       it is clear the panelists shared this prior)
 #
-# Output: prints the path of the .md it wrote. Writes ONLY under ~/.claude/unifusion-runs/
-# (internal disk) — never ~/Projects or /Volumes/4T (the external 4T is TCC-blocked).
+# Output: prints the path of the .md it wrote. Writes ONLY under
+# ${UNIFABLE_DATA:-$HOME/.unifable}/unifusion-runs/ (internal disk) — never ~/Projects or
+# /Volumes/4T (the external 4T is TCC-blocked).
 
 set -uo pipefail
 
@@ -41,7 +42,7 @@ if [ "$#" -eq 1 ] && [ -d "$1" ]; then
       codex_out)  echo "gpt5.5" ;;
       gemini_out) echo "gemini3.5flash" ;;
       kimi_out)   echo "kimi2.7" ;;
-      devin_out)  echo "glm5.2" ;;
+      glm_out)    echo "glm5.2" ;;
       *)          echo "$1" ;;
     esac
   }
@@ -53,7 +54,7 @@ if [ "$#" -eq 1 ] && [ -d "$1" ]; then
   done
 fi
 
-RUNS_DIR="$HOME/.claude/unifusion-runs"
+RUNS_DIR="${UNIFABLE_DATA:-$HOME/.unifable}/unifusion-runs"
 mkdir -p "$RUNS_DIR"
 ts="$(date +%Y-%m-%d_%H%M%S)"
 out="$RUNS_DIR/${ts}_${slug}.md"

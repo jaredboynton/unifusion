@@ -1,38 +1,29 @@
 #!/usr/bin/env bash
-# unifusion.sh — the single Unifusion entrypoint. Auto-detects every available panelist CLI, builds a
-# best-effort shared session-context brief, assembles ONE canonical prompt, and fans the whole panel out
-# in parallel and blind. Opus (via `cb`) is always a panelist; every external CLI that is installed joins
-# too. The caller does only two things after this returns: JUDGE the answers and SAVE provenance.
+# unifusion.sh — run a frontier-research panel via a single Fable orchestrator on OpenCode.
 #
 # Usage:
 #   unifusion.sh <question_file> [run_dir]
 #
-# - <question_file> : the user's question, VERBATIM (write it before calling; do not pre-digest it).
-# - [run_dir]       : optional dir to hold this run's prompt/outputs; a fresh mktemp dir is used if omitted.
-#
-# What it does (folds in the old detect_panel + preflight + context + per-CLI launch steps):
-#   1. Detects panelist CLIs: cb (Opus/Bedrock), codex (GPT-5.5), agy (Gemini), kimi (Kimi), devin (GLM).
-#   2. Builds a FACTUAL session-context brief (summarize_session.sh, best-effort; skipped silently if it
-#      can't be built). The identical brief is shared by every panelist — the panel's one allowed prior.
-#   3. Assembles the canonical panelist prompt ([SESSION CONTEXT]? + [INSTRUCTIONS] + verbatim [TASK])
-#      into <run_dir>/panel_prompt.md. This same file is what every panelist receives.
-#   4. Fans out ALL available panelists as background jobs into <run_dir>/<label>_out.md, in parallel and
-#      blind. Opus always runs; with NO external CLI present a SECOND Opus runs (the two-cold-Opus
-#      opus4.8-4.8 fallback). A failing/missing panelist drops only itself; the run never aborts.
-#   5. Waits for all, then prints a manifest the caller greps: RUN_DIR=, PANEL_PROMPT=, SLUG=, CONTEXT=,
-#      and one `PANELIST <label> <ok|dropped:reason> <out_path>` line per panelist, plus a rough estimate.
-#
-# This script never judges and never writes final provenance — Opus (the orchestrator) is the sole judge
-# and must stay a separate process from the cb-launched Opus panelist. Always exits 0 (degradation is
-# per-panelist, never fatal).
-#
-# Env knobs (advanced; sensible defaults): UNIFUSION_TIMEOUT (per-panelist seconds, default 300),
-# UNIFUSION_OPUS_MODEL (cb model, default opus), KIMI_MODEL, DEVIN_MODEL, AGY_MODEL,
-# UNIFUSION_CONTEXT_PROVIDER + GEMINI_API_KEY/GOOGLE_API_KEY (enable the session brief).
+# Flow:
+#   1. Build a factual shared context brief when available.
+#   2. Assemble one orchestrator prompt with that brief plus the verbatim task.
+#   3. Start ONE warm `opencode serve` daemon (skill-local config, merged over the
+#      user's global providers/auth/MCP).
+#   4. Run ONE `unifusion-orchestrator` attach thread: Fable devises a research strategy,
+#      dispatches panelist subagents in parallel via the `task` tool, synthesizes, and
+#      returns [FINAL]/[ANALYSIS] plus an optional deliverable file under cwd.
+#   5. Kill the daemon, persist analysis/final artifacts, panelist reports, and provenance.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/_unifusion_lib.sh"
+
+OPENCODE_BIN="${UNIFUSION_OPENCODE_BIN:-opencode}"
+OPENCODE_CFG="${UNIFUSION_OPENCODE_CONFIG:-$SCRIPT_DIR/../opencode/opencode.json}"
+PARSE_EVENTS="$SCRIPT_DIR/../opencode/parse_events.py"
+
+orch_agent="${UNIFUSION_ORCH_AGENT:-unifusion-orchestrator}"
 
 question_file="${1:?usage: unifusion.sh <question_file> [run_dir]}"
 case "$question_file" in
@@ -43,6 +34,26 @@ if [ ! -s "$question_file" ]; then
   echo "[unifusion] question file is missing or empty: $question_file" >&2
   exit 2
 fi
+if ! have "$OPENCODE_BIN"; then
+  echo "[unifusion] opencode CLI not installed — cannot run OpenCode-native Unifusion." >&2
+  exit 127
+fi
+if ! have python3; then
+  echo "[unifusion] python3 not installed — cannot parse opencode JSON output." >&2
+  exit 127
+fi
+if ! have curl; then
+  echo "[unifusion] curl not installed — cannot talk to the opencode server." >&2
+  exit 127
+fi
+if [ ! -s "$OPENCODE_CFG" ]; then
+  echo "[unifusion] missing opencode config: $OPENCODE_CFG" >&2
+  exit 2
+fi
+case "$OPENCODE_CFG" in
+  /*) ;;
+  *) OPENCODE_CFG="$(cd "$(dirname "$OPENCODE_CFG")" && pwd -P)/$(basename "$OPENCODE_CFG")" ;;
+esac
 
 run_dir="${2:-}"
 if [ -z "$run_dir" ]; then
@@ -55,17 +66,28 @@ case "$run_dir" in
   *) run_dir="$(cd "$run_dir" && pwd -P)" ;;
 esac
 
-have() { command -v "$1" >/dev/null 2>&1; }
+cwd="$(pwd -P)"
+review_root="$run_dir/reports"
+mkdir -p "$review_root"
 
-# ---- 1. detect panelists --------------------------------------------------------------------------
-cb_ok=false; codex_ok=false; agy_ok=false; kimi_ok=false; devin_ok=false
-have cb    && cb_ok=true
-have codex && codex_ok=true
-have agy   && agy_ok=true
-have kimi  && kimi_ok=true
-have devin && devin_ok=true
+orch_timeout="${UNIFUSION_ORCH_TIMEOUT:-1500}"
+server_wait="${UNIFUSION_SERVER_WAIT:-30}"
 
-# ---- 2. best-effort shared session-context brief --------------------------------------------------
+# Panelist slug tokens for provenance (orchestrator dispatches all four by default).
+default_panelists="gpt5.5 grok4.3 glm5.2 kimi2.7"
+panelist_slugs=()
+if [ -n "${UNIFUSION_PANELISTS:-}" ]; then
+  IFS=',' read -r -a panelist_slugs <<<"${UNIFUSION_PANELISTS}"
+else
+  read -r -a panelist_slugs <<<"$default_panelists"
+fi
+
+# Deliverable path under cwd (orchestrator can write here; external /tmp is auto-rejected).
+deliverable_rel="${UNIFUSION_DELIVERABLE_REL:-.unifusion-deliverable.md}"
+deliverable_path="$cwd/$deliverable_rel"
+rm -f "$deliverable_path"
+
+# ---- best-effort shared session-context brief ----------------------------------------------------
 context_file="$run_dir/context.md"
 context_state="none"
 if bash "$SCRIPT_DIR/summarize_session.sh" "$context_file" >"$run_dir/context.log" 2>&1 && [ -s "$context_file" ]; then
@@ -74,106 +96,247 @@ else
   rm -f "$context_file"
 fi
 
-# ---- 3. assemble the one canonical panelist prompt -----------------------------------------------
-panel_prompt="$run_dir/panel_prompt.md"
+# ---- orchestrator prompt -------------------------------------------------------------------------
+orch_prompt="$run_dir/orch_prompt.md"
 {
   if [ "$context_state" != "none" ]; then
-    echo "[SESSION CONTEXT — shared background, same for every panelist; factual only]"
+    echo "[SESSION CONTEXT — shared factual background; not a proposed approach]"
     cat "$context_file"
     echo
   fi
-  cat <<'INSTR'
-[INSTRUCTIONS]
-You are one of several independent experts answering the same question in parallel. You will not see the
-others' answers. Research with web search and your local bash/tools, then return a complete, self-contained
-answer in the user's language.
+  cat <<EOF
+[DELIVERABLE PATH]
+Write the user-facing final answer (markdown body only, no [FINAL] markers) to this repo-relative path:
+${deliverable_rel}
 
-Ground every claim in evidence you actually gathered this run:
-- For any claim about this codebase or local system, cite the concrete file path and line, or the command
-  and its output, that you actually read or ran. Run the code or read the file; never assert from memory.
-- For any claim from the web, cite the source URL you actually opened, and prefer primary or official
-  sources over second-hand summaries.
-- Label anything you could not verify as unverified.
+[PANELISTS]
+Dispatch these subagents (all four unless noted): panelist-gpt (GPT-5.5), panelist-grok (Grok 4.3), panelist-glm (GLM-5.2), panelist-kimi (Kimi K2.7).
+Expected slug tokens for this run: ${panelist_slugs[*]}.
 
-Use current information:
-- Verify the latest stable version of any library, framework, tool, or API on the web this run; never rely
-  on a recalled version number.
-- Check the current official documentation for any API you reference, and say when behavior is
-  version-specific.
-- Prefer actively maintained repositories and recent, still-relevant papers; note the release or
-  publication date of sources you lean on, and flag anything deprecated or superseded as of today.
+[TASK]
+Find the strongest current technical approach for the user's request below. Devise complementary research
+angles, dispatch all panelists in ONE turn, synthesize, and produce [FINAL] and [ANALYSIS].
 
-[TASK — answer this, verbatim]
-INSTR
+[USER REQUEST — verbatim]
+EOF
   cat "$question_file"
-} > "$panel_prompt"
+} >"$orch_prompt"
 
-# ---- 4. fan out, in parallel and blind -----------------------------------------------------------
-labels=(); slugtokens=(); pids=(); outs=()
+analysis_path="$run_dir/analysis.md"
+final_path="$run_dir/final.md"
+serve_log="$run_dir/serve.log"
+orch_events="$run_dir/orchestrator.events.json"
+orch_log="$run_dir/orchestrator.log"
 
-launch() {
-  # launch <label> <slug_token> <out_basename> <runner> [args...]
-  local label="$1" token="$2" outbase="$3"; shift 3
-  local out="$run_dir/$outbase"
-  "$@" "$panel_prompt" "$out" >"$run_dir/${label}.log" 2>&1 &
-  pids+=("$!"); labels+=("$label"); slugtokens+=("$token"); outs+=("$out")
+# ---- start the warm daemon -----------------------------------------------------------------------
+opencode_pids() { pgrep -f "$OPENCODE_BIN" 2>/dev/null | sort -u; }
+baseline_pids=" $(opencode_pids | tr '\n' ' ') "
+
+server_pid=""
+cleanup() {
+  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null
+  fi
+  local p
+  for p in $(opencode_pids); do
+    case "$baseline_pids" in *" $p "*) continue ;; esac
+    kill "$p" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5; do
+    local remaining=""
+    for p in $(opencode_pids); do
+      case "$baseline_pids" in *" $p "*) continue ;; esac
+      remaining="yes"
+    done
+    [ -z "$remaining" ] && break
+    sleep 0.2
+  done
+  for p in $(opencode_pids); do
+    case "$baseline_pids" in *" $p "*) continue ;; esac
+    kill -9 "$p" 2>/dev/null || true
+  done
 }
+trap cleanup EXIT INT TERM
 
-# Opus is always a panelist.
-launch opus-A opus4.8 cb_out.md bash "$SCRIPT_DIR/run_cb.sh"
+OPENCODE_CONFIG="$OPENCODE_CFG" "$OPENCODE_BIN" serve --port 0 </dev/null >"$serve_log" 2>&1 &
+server_pid=$!
 
-ext=0
-$codex_ok && { launch gpt5.5         gpt5.5         codex_out.md  bash "$SCRIPT_DIR/run_codex.sh"  ; ext=$((ext+1)); }
-$agy_ok   && { launch gemini3.5flash gemini3.5flash gemini_out.md bash "$SCRIPT_DIR/run_gemini.sh" ; ext=$((ext+1)); }
-$kimi_ok  && { launch kimi2.7        kimi2.7        kimi_out.md   bash "$SCRIPT_DIR/run_kimi.sh"   ; ext=$((ext+1)); }
-$devin_ok && { launch glm5.2         glm5.2         devin_out.md  bash "$SCRIPT_DIR/run_devin.sh"  ; ext=$((ext+1)); }
-
-# No external CLI at all -> run a SECOND cold Opus (the opus4.8-4.8 fallback).
-if [ "$ext" -eq 0 ]; then
-  launch opus-B opus4.8 cb_out_b.md bash "$SCRIPT_DIR/run_cb.sh"
+server_url=""
+deadline=$(( $(date +%s) + server_wait ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "[unifusion] opencode serve exited during startup; tail of log:" >&2
+    tail -20 "$serve_log" >&2
+    exit 1
+  fi
+  server_url="$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$serve_log" | head -1)"
+  [ -n "$server_url" ] && break
+  sleep 0.25
+done
+if [ -z "$server_url" ]; then
+  echo "[unifusion] opencode serve did not report a listen URL within ${server_wait}s; tail of log:" >&2
+  tail -20 "$serve_log" >&2
+  exit 1
 fi
 
-# ---- 5. wait, collect, report --------------------------------------------------------------------
-statuses=()
-for i in "${!pids[@]}"; do
-  wait "${pids[$i]}"; statuses+=("$?")
-done
+orch_session="$(curl -s -X POST "${server_url}/session" -H 'content-type: application/json' -d '{}' \
+  | python3 -c 'import sys,json;print((json.load(sys.stdin) or {}).get("id",""))' 2>/dev/null)"
+if [ -z "$orch_session" ]; then
+  echo "[unifusion] could not create an orchestrator session." >&2
+  exit 1
+fi
+printf '%s\n' "$orch_session" >"$run_dir/orchestrator.session"
 
-reason_for() {
-  case "$1" in
-    0)   echo "ok" ;;
-    124) echo "dropped:timeout" ;;
-    127) echo "dropped:cli-missing" ;;
-    2)   echo "dropped:bad-prompt" ;;
-    *)   echo "dropped:exit-$1" ;;
-  esac
+# ---- orchestrator run ----------------------------------------------------------------------------
+orch_args=(run --attach "$server_url" --session "$orch_session" --dir "$cwd" --agent "$orch_agent" --auto --format json)
+OPENCODE_CONFIG="$OPENCODE_CFG" _run_with_timeout "$orch_timeout" \
+  "$OPENCODE_BIN" "${orch_args[@]}" <"$orch_prompt" >"$orch_events" 2>"$orch_log"
+orch_status=$?
+
+if [ "$orch_status" -ne 0 ] || [ ! -s "$orch_events" ]; then
+  echo "[unifusion] orchestrator failed (status $orch_status); tail of log:" >&2
+  tail -20 "$orch_log" >&2
+  exit 1
+fi
+
+# ---- extract panelist reports from task tool events ----------------------------------------------
+python3 - "$orch_events" "$review_root" "$PARSE_EVENTS" <<'PY'
+import importlib.util
+import json
+import pathlib
+import sys
+
+events_path, review_root, parser_path = sys.argv[1:4]
+
+spec = importlib.util.spec_from_file_location("parse_events", parser_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+slug_map = {
+    "panelist-gpt": "gpt5.5",
+    "panelist-grok": "grok4.3",
+    "panelist-glm": "glm5.2",
+    "panelist-kimi": "kimi2.7",
 }
 
-# Slug = the tokens of panelists that actually returned a usable answer (driver-first opus4.8).
-run_tokens=()
-ok_count=0
-for i in "${!labels[@]}"; do
-  if [ "${statuses[$i]}" -eq 0 ] && [ -s "${outs[$i]}" ]; then
-    run_tokens+=("${slugtokens[$i]}"); ok_count=$((ok_count+1))
+root = pathlib.Path(review_root)
+root.mkdir(parents=True, exist_ok=True)
+
+for task in mod.extract_task_results(events_path):
+    subagent = task.get("subagent") or "unknown"
+    slug = slug_map.get(subagent, subagent.replace("panelist-", ""))
+    output = (task.get("output") or "").strip()
+    status = task.get("status") or ""
+    out_path = root / f"{slug}.md"
+    if output:
+        out_path.write_text(output + ("\n" if not output.endswith("\n") else ""))
+    else:
+        out_path.write_text(f"_(empty; task status={status})_\n")
+PY
+
+# ---- parse [FINAL] / [ANALYSIS] from orchestrator stream ----------------------------------------
+python3 - "$orch_events" "$final_path" "$analysis_path" "$PARSE_EVENTS" <<'PY'
+import importlib.util
+import pathlib
+import re
+import sys
+
+events_path, final_path, analysis_path, parser_path = sys.argv[1:5]
+
+spec = importlib.util.spec_from_file_location("parse_events", parser_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+result = mod.extract_final_text(events_path)
+
+
+def extract(name: str) -> str:
+    m = re.search(rf"\[{name}\]\s*(.*?)\s*\[/{name}\]", result, re.S)
+    return (m.group(1).strip() + "\n") if m else ""
+
+
+final = extract("FINAL")
+analysis = extract("ANALYSIS")
+if not final:
+    final = result.rstrip() + ("\n" if result else "")
+if not analysis:
+    analysis = result.rstrip() + ("\n" if result else "")
+
+pathlib.Path(final_path).write_text(final)
+pathlib.Path(analysis_path).write_text(analysis)
+PY
+
+if ! _has_content "$final_path"; then
+  if _has_content "$deliverable_path"; then
+    cp "$deliverable_path" "$final_path"
+  else
+    echo "[unifusion] empty final answer from orchestrator." >&2
+    exit 1
+  fi
+fi
+if ! _has_content "$analysis_path"; then
+  echo "[unifusion] empty analysis from orchestrator." >&2
+  exit 1
+fi
+
+# ---- panelist manifest from task results ---------------------------------------------------------
+ok_labels=(); missing_labels=(); label_specs=()
+for slug in "${panelist_slugs[@]}"; do
+  report="$review_root/${slug}.md"
+  if _has_content "$report" && ! grep -q '^_(empty' "$report" 2>/dev/null; then
+    ok_labels+=("$slug")
+    label_specs+=("${slug}=${report}")
+  else
+    missing_labels+=("${slug} (no-report)")
   fi
 done
-if [ "${#run_tokens[@]}" -eq 0 ]; then
-  slug="opus4.8"   # nothing returned; record the intended driver
-else
-  slug="$(IFS=-; echo "${run_tokens[*]}")"
+
+# ---- provenance + manifest -----------------------------------------------------------------------
+cleanup
+server_pid=""
+trap - EXIT INT TERM
+
+slug="opencode-fable"
+if [ "${#ok_labels[@]}" -gt 0 ]; then
+  slug="opencode-fable-$(IFS=-; echo "${ok_labels[*]}")"
 fi
 
-words="$(wc -w < "$question_file" | tr -d ' ')"
-in_tokens=$(( words * 4 / 3 ))
+panel_note=""
+if [ "${#missing_labels[@]}" -gt 0 ]; then
+  panel_note="dropped: $(IFS=', '; echo "${missing_labels[*]}")"
+fi
+
+words="$(wc -w <"$question_file" | tr -d ' ')"
+in_tokens=$((words * 4 / 3))
+estimate="~${words} words (~${in_tokens} input tokens) sent to one Fable orchestrator on a warm opencode daemon; orchestrator dispatches ${#panelist_slugs[@]} panelist subagents via task; orchestrator timeout ${orch_timeout}s."
+
+provenance_path=""
+if [ "${UNIFUSION_SAVE_RUN:-1}" = "1" ]; then
+  save_env=()
+  [ -n "$panel_note" ] && save_env+=(UNIFUSION_PANEL_NOTE="$panel_note")
+  [ "$context_state" != "none" ] && save_env+=(UNIFUSION_CONTEXT_FILE="$context_file")
+  save_env+=(UNIFUSION_ESTIMATE="$estimate")
+  provenance_path="$(env "${save_env[@]}" bash "$SCRIPT_DIR/save_run.sh" "$slug" "$question_file" "$analysis_path" "$final_path" "${label_specs[@]}")"
+fi
 
 echo "RUN_DIR=$run_dir"
-echo "PANEL_PROMPT=$panel_prompt"
+echo "ORCH_PROMPT=$orch_prompt"
 echo "CONTEXT=$context_state"
+echo "OPENCODE_CONFIG=$OPENCODE_CFG"
+echo "SERVER_URL=$server_url"
+echo "DELIVERABLE=$deliverable_path"
 echo "SLUG=$slug"
-echo "ESTIMATE=~${words} words (~${in_tokens} input tokens) sent to each of ${#labels[@]} panelists; per-panelist timeout ${UNIFUSION_TIMEOUT:-300}s; real cost is several x input."
-echo "panel ($ok_count/${#labels[@]} returned):"
-for i in "${!labels[@]}"; do
-  printf 'PANELIST %s %s %s\n' "${labels[$i]}" "$(reason_for "${statuses[$i]}")" "${outs[$i]}"
+echo "ANALYSIS=$analysis_path"
+echo "FINAL=$final_path"
+[ -n "$provenance_path" ] && echo "PROVENANCE=$provenance_path"
+echo "ESTIMATE=$estimate"
+echo "panel (${#ok_labels[@]}/${#panelist_slugs[@]} returned):"
+for slug in "${panelist_slugs[@]}"; do
+  report="$review_root/${slug}.md"
+  if printf '%s\n' "${ok_labels[@]}" | grep -qx "$slug"; then
+    printf 'PANELIST %s ok %s\n' "$slug" "$report"
+  else
+    printf 'PANELIST %s dropped:no-report %s\n' "$slug" "$report"
+  fi
 done
 
 exit 0

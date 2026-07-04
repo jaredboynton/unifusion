@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// compact-full-transcript.mjs — summarize a Claude Code session transcript into a schema-constrained
-// structured brief. Vendored from claudecompact-patcher for the Unifusion skill's session-context step.
+// compact-full-transcript.mjs — summarize a session transcript into a schema-constrained
+// structured brief. Vendored from patchpress for the Unifusion skill's session-context step.
 //
 // Usage:
-//   node compact-full-transcript.mjs --provider gemini --session current --out-dir <dir> [--no-live-output]
+//   node compact-full-transcript.mjs --provider gemini --transcript <path> --out-dir <dir> [--no-live-output]
 //   node compact-full-transcript.mjs --provider gemini --input <transcript.jsonl> --out-dir <dir>
 //
 // Transcript source (one of):
@@ -11,28 +11,105 @@
 //   --transcript <path>      explicit transcript path; UNIFUSION_TRANSCRIPT is its env equivalent
 //   --session current|<id>   Claude Code: locate via CLAUDE_CODE_SESSION_ID + the projects dir; exits 3 if none
 //
-// Providers (--provider, default codex): codex | gemini | xai | mantle. All use native JSON-schema
-// structured output. Keep the four provider dispatch paths in sync when editing. The brief is written to <out-dir>/summary.md
-// (full run record in <out-dir>/result.json). Steer content with --summary-instructions "<text>".
 // See AGENTS.md for how summarize_session.sh wires this into the Unifusion panel.
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
 import { arch, homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  evaluateHandoffDensity,
+  DEFAULT_DENSITY_THRESHOLDS,
+  buildLiteralReaskFeedback,
+  buildTruncationReaskFeedback,
+} from "./handoff-density.mjs";
+import { buildPromptAdaptations, modelTraits } from "./prompt-adaptation.mjs";
+import { rendererTranscriptGuide } from "./renderer-prompt-guides.mjs";
+import {
+  compactFormattedEdit,
+  extractEditCapsules,
+  formatToolResult,
+  formatToolResultContent,
+  formatToolUse,
+  isFormattedEditText,
+} from "./tool-use-format.mjs";
+
+// Load .env relative to the script directory
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const envPath = resolve(__dirname, "../.env");
+if (existsSync(envPath)) {
+  const envContent = readFileSync(envPath, "utf8");
+  for (const line of envContent.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.substring(0, eqIdx).trim();
+    let val = trimmed.substring(eqIdx + 1).trim();
+    // Strip quotes
+    if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+      val = val.substring(1, val.length - 1);
+    }
+    // Simple interpolation for self-references
+    if (val.startsWith("$")) {
+      const refKey = val.slice(1);
+      if (process.env[refKey]) {
+        val = process.env[refKey];
+      }
+    }
+    if (!process.env[key]) {
+      process.env[key] = val;
+    }
+  }
+}
 
 function argValue(name, fallback = undefined) {
   const idx = process.argv.indexOf(name);
   return idx === -1 ? fallback : process.argv[idx + 1];
 }
 
+// Real-tokenizer count for the codex default-model switch. Loads js-tiktoken
+// lazily (only codex default runs reach here) and memoizes the encoder. gpt-5.x
+// is not in js-tiktoken's model map, so encodingForModel falls back to the
+// o200k_base encoding it shares. Any tokenizer failure degrades to the char/4
+// estimate with a stderr warning rather than failing the compaction.
+let _compactEncoder;
+async function countRenderedTokens(text, model) {
+  try {
+    if (!_compactEncoder) {
+      const tk = await import("js-tiktoken");
+      try {
+        _compactEncoder = tk.encodingForModel(model);
+      } catch {
+        _compactEncoder = tk.getEncoding("o200k_base");
+      }
+    }
+    return _compactEncoder.encode(text).length;
+  } catch (error) {
+    process.stderr.write(
+      "[codex model-switch] tokenizer unavailable, using char/4 estimate: " +
+        error.message +
+        "\n"
+    );
+    return Math.ceil(text.length / 4);
+  }
+}
+
+const PROVIDER_REGISTRY = {
+  codex:  { family: "codex",  defaultModel: () => process.env.CODEX_COMPACT_MODEL || "gpt-5.4", resolveModel: (renderedTokens) => renderedTokens < CODEX_MODEL_TOKEN_THRESHOLD ? "gpt-5.4-mini" : "gpt-5.4" },
+  gemini: { family: "gemini", resolveKey: () => process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "", endpoint: () => (process.env.GEMINI_API_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "") + "/models/" + encodeURIComponent(MODEL) + ":streamGenerateContent?alt=sse", defaultModel: () => process.env.GEMINI_COMPACT_MODEL || "gemini-3.5-flash", missingKeyMsg: "Missing GEMINI_API_KEY or GOOGLE_API_KEY for --provider gemini" },
+  xai:    { family: "chat",   resolveKey: () => process.env.XAI_API_KEY || "", endpoint: () => (process.env.XAI_API_BASE_URL || "https://api.x.ai/v1").replace(/\/$/, "") + "/chat/completions", defaultModel: () => process.env.XAI_COMPACT_MODEL || "grok-4.20-0309-non-reasoning", missingKeyMsg: "Missing XAI_API_KEY for --provider xai" },
+  mantle: { family: "chat",   resolveKey: () => process.env.MANTLE_API_KEY || process.env.BEDROCK_MANTLE_API_KEY || process.env.AWS_BEARER_TOKEN_BEDROCK || "", endpoint: () => process.env.MANTLE_CHAT_COMPLETIONS_URL || "https://bedrock-mantle.us-west-2.api.aws/openai/v1/chat/completions", defaultModel: () => process.env.MANTLE_COMPACT_MODEL || "xai.grok-4.3", missingKeyMsg: "Missing MANTLE_API_KEY, BEDROCK_MANTLE_API_KEY, or AWS_BEARER_TOKEN_BEDROCK for --provider mantle" },
+};
+
 function normalizeProvider(value) {
   const provider = String(value || "codex").toLowerCase();
-  if (provider === "codex" || provider === "gemini" || provider === "xai" || provider === "mantle") {
+  if (Object.prototype.hasOwnProperty.call(PROVIDER_REGISTRY, provider)) {
     return provider;
   }
-  throw new Error("Unsupported provider: " + value + " (expected codex, gemini, xai, or mantle)");
+  throw new Error("Unsupported provider: " + value + " (expected " + Object.keys(PROVIDER_REGISTRY).join(", ") + ")");
 }
 
 const PROVIDER = normalizeProvider(
@@ -47,28 +124,69 @@ const CODEX_INSTALLATION_ID_PATH =
 const CODEX_ORIGINATOR = process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || "codex_cli_rs";
 const CODEX_CLIENT_VERSION = process.env.CODEX_CLIENT_VERSION || resolveCodexClientVersion();
 const CODEX_USER_AGENT = process.env.CODEX_USER_AGENT || buildCodexUserAgent();
-const GEMINI_API_KEY = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "";
-const GEMINI_API_BASE_URL =
-  process.env.GEMINI_API_BASE_URL || "https://generativelanguage.googleapis.com/v1beta";
-const XAI_API_KEY = process.env.XAI_API_KEY || "";
-const XAI_API_BASE_URL = process.env.XAI_API_BASE_URL || "https://api.x.ai/v1";
-const MANTLE_API_KEY = process.env.MANTLE_API_KEY || process.env.BEDROCK_MANTLE_API_KEY || "";
-const MANTLE_CHAT_COMPLETIONS_URL =
-  process.env.MANTLE_CHAT_COMPLETIONS_URL ||
-  "https://bedrock-mantle.us-west-2.api.aws/openai/v1/chat/completions";
-const MODEL =
+
+function resolveTranscriptFromSession(sessionArg) {
+  const cfg = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const projroot = join(cfg, "projects");
+  const sid =
+    sessionArg && sessionArg !== "current" ? sessionArg : process.env.CLAUDE_CODE_SESSION_ID || "";
+  if (sid) {
+    try {
+      for (const ent of readdirSync(projroot, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue;
+        const cand = join(projroot, ent.name, sid + ".jsonl");
+        if (existsSync(cand)) return cand;
+      }
+    } catch {}
+  }
+  return "";
+}
+
+// Transcript source precedence: --input > --transcript / UNIFUSION_TRANSCRIPT > --session (Claude only).
+const sessionArg = argValue("--session", "");
+let resolvedInput =
+  argValue("--input", "") || argValue("--transcript", "") || process.env.UNIFUSION_TRANSCRIPT || "";
+if (!resolvedInput && sessionArg) {
+  resolvedInput = resolveTranscriptFromSession(sessionArg);
+}
+if (!resolvedInput) {
+  console.error(
+    "[compact] no transcript source: pass --input <path>, --transcript <path>, UNIFUSION_TRANSCRIPT=<path>, " +
+      "or --session current (Claude Code; CLAUDE_CODE_SESSION_ID=" +
+      (process.env.CLAUDE_CODE_SESSION_ID || "unset") +
+      ")"
+  );
+  process.exit(3);
+}
+const inputPath = resolve(resolvedInput);
+let MODEL =
   argValue("--model") ||
   process.env.COMPACT_MODEL ||
-  (PROVIDER === "gemini"
-    ? process.env.GEMINI_COMPACT_MODEL || "gemini-3.5-flash"
-    : PROVIDER === "xai"
-      ? process.env.XAI_COMPACT_MODEL || "grok-4.20-0309-non-reasoning"
-      : PROVIDER === "mantle"
-        ? process.env.MANTLE_COMPACT_MODEL || "xai.grok-4.3"
-        : process.env.CODEX_COMPACT_MODEL || "gpt-5.4");
+  PROVIDER_REGISTRY[PROVIDER].defaultModel();
+// When codex runs on its default model (no explicit override), MODEL is
+// re-resolved after the transcript is rendered: gpt-5.5 when the rendered
+// transcript fits its 272k-token input window, else gpt-5.4. See the
+// post-render block in main() and PROVIDER_REGISTRY.codex.resolveModel.
+const MODEL_EXPLICIT = Boolean(
+  argValue("--model") || process.env.COMPACT_MODEL || process.env.CODEX_COMPACT_MODEL
+);
+const CODEX_MODEL_TOKEN_THRESHOLD = Number.parseInt(
+  process.env.CODEX_MODEL_TOKEN_THRESHOLD || "272000",
+  10
+);
 const SERVICE_TIER = process.env.CODEX_COMPACT_SERVICE_TIER || "priority";
 const REASONING_EFFORT = process.env.CODEX_COMPACT_REASONING_EFFORT || "low";
-const GEMINI_THINKING_LEVEL = process.env.GEMINI_COMPACT_THINKING_LEVEL || "none";
+// Flash-Lite defaults to minimal thinking. With the schema-shape duplication removed
+// from the prompt, the continuation anchor (current work + next step) always rendered
+// into the handoff, and the capsule floor at 30, minimal thinking + reask-until-pass
+// holds 100 deterministic and 10/10 judge at ~4-6s on onto -- an ~8x speedup over the
+// low-thinking lane (~31s) with no semantic-quality loss. minimal collapses below the
+// 50-capsule floor (~25-32 caps), which is why the floor is 30, not 50; low thinking
+// remains available (GEMINI_COMPACT_THINKING_LEVEL=low) when maximum evidence density
+// (57+ caps, deterministic 100 at the 50 floor) is wanted.
+const GEMINI_THINKING_LEVEL =
+  process.env.GEMINI_COMPACT_THINKING_LEVEL ||
+  (MODEL.includes("flash-lite") ? "minimal" : "none");
 const GEMINI_MAX_OUTPUT_TOKENS = Number.parseInt(
   process.env.GEMINI_COMPACT_MAX_OUTPUT_TOKENS || "65536",
   10
@@ -161,44 +279,6 @@ function buildCodexUserAgent() {
   );
 }
 
-function resolveTranscriptFromSession(sessionArg) {
-  const cfg = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const projroot = join(cfg, "projects");
-  const sid =
-    sessionArg && sessionArg !== "current" ? sessionArg : process.env.CLAUDE_CODE_SESSION_ID || "";
-  // Primary: find <sid>.jsonl anywhere under projects (survives a mid-session cd).
-  if (sid) {
-    try {
-      for (const ent of readdirSync(projroot, { withFileTypes: true })) {
-        if (!ent.isDirectory()) continue;
-        const cand = join(projroot, ent.name, sid + ".jsonl");
-        if (existsSync(cand)) return cand;
-      }
-    } catch {}
-  }
-  // Unresolved id -> "" (caller fails closed). resolve_session.sh handles non-Claude hosts and
-  // ambiguous cwds deterministically and passes an explicit --transcript.
-  return "";
-}
-
-// Transcript source precedence: --input > --transcript / UNIFUSION_TRANSCRIPT > --session (Claude only).
-// If nothing resolves, fail closed (exit 3).
-const sessionArg = argValue("--session", "");
-let resolvedInput =
-  argValue("--input", "") || argValue("--transcript", "") || process.env.UNIFUSION_TRANSCRIPT || "";
-if (!resolvedInput && sessionArg) {
-  resolvedInput = resolveTranscriptFromSession(sessionArg);
-}
-if (!resolvedInput) {
-  console.error(
-    "[compact] no transcript source: pass --input <path>, --transcript <path>, UNIFUSION_TRANSCRIPT=<path>, " +
-      "or --session current (Claude Code; CLAUDE_CODE_SESSION_ID=" +
-      (process.env.CLAUDE_CODE_SESSION_ID || "unset") +
-      ")"
-  );
-  process.exit(3);
-}
-const inputPath = resolve(resolvedInput);
 const preserveTailCount = intArg("--preserve-tail", 16);
 const dryRun = process.argv.includes("--dry-run");
 const liveOutput = !process.argv.includes("--no-live-output");
@@ -209,15 +289,73 @@ const rendererStatsRenderers = argValue("--renderer-stats-renderers", "stripped,
   .map((value) => value.trim())
   .filter(Boolean);
 for (const renderer of rendererStatsRenderers) {
-  if (renderer !== "stripped" && renderer !== "sentinel" && renderer !== "jsonl") {
-    throw new Error("Expected --renderer-stats-renderers entries to be stripped, sentinel, or jsonl");
+  if (renderer !== "stripped" && renderer !== "sentinel" && renderer !== "jsonl" && renderer !== "onto") {
+    throw new Error("Expected --renderer-stats-renderers entries to be stripped, sentinel, jsonl, or onto");
   }
 }
 const temperatureRaw = argValue("--temperature", process.env.COMPACT_TEMPERATURE || "");
-const TEMPERATURE = temperatureRaw === "" ? null : Number.parseFloat(temperatureRaw);
+let TEMPERATURE = temperatureRaw === "" ? null : Number.parseFloat(temperatureRaw);
 if (temperatureRaw !== "" && !Number.isFinite(TEMPERATURE)) {
   throw new Error("Expected --temperature to be a finite number");
 }
+// Default temperature 0.4 for Grok 4.3 (mantle), Grok 4.20 (xai), and Gemini
+// Flash-Lite when not set explicitly.
+if (
+  TEMPERATURE === null &&
+  (MODEL.includes("grok-4.3") || MODEL.includes("grok-4.20") || MODEL.includes("flash-lite"))
+) {
+  TEMPERATURE = 0.4;
+}
+// Reasoning effort for the OpenAI-compatible chat-completions providers (xai/mantle).
+// Empty means omit the field and use the server default. Codex uses its own reasoning plumbing.
+const CHAT_REASONING_EFFORT = argValue("--reasoning-effort", process.env.COMPACT_REASONING_EFFORT || "");
+// Density-gated validate-and-reask loop (docs/prompt-adaptation/design.md). Off by
+// default (--max-reasks 0); when >0, a structurally-valid but thin handoff is
+// re-requested with corrective feedback up to N times, keeping the densest attempt.
+// --reask-until-pass loops until the density gate clears (cap: --max-reasks, default 10).
+// gemini flash-lite auto-enables until-pass on every renderer; opt out with
+// --no-reask-until-pass or COMPACT_REASK_UNTIL_PASS=0.
+const REASK_UNTIL_PASS_EXPLICIT =
+  process.argv.includes("--reask-until-pass") || process.env.COMPACT_REASK_UNTIL_PASS === "1";
+const REASK_UNTIL_PASS_DISABLED =
+  process.argv.includes("--no-reask-until-pass") || process.env.COMPACT_REASK_UNTIL_PASS === "0";
+const FLASH_LITE_MODEL = MODEL.includes("flash-lite");
+const REASK_UNTIL_PASS =
+  !REASK_UNTIL_PASS_DISABLED && (REASK_UNTIL_PASS_EXPLICIT || FLASH_LITE_MODEL);
+const REASK_UNTIL_PASS_SOURCE = REASK_UNTIL_PASS
+  ? REASK_UNTIL_PASS_EXPLICIT
+    ? process.argv.includes("--reask-until-pass")
+      ? "flag"
+      : "env"
+    : FLASH_LITE_MODEL
+      ? "flash-lite-default"
+      : null
+  : null;
+const MAX_REASKS = intArg(
+  "--max-reasks",
+  Number.parseInt(process.env.COMPACT_MAX_REASKS || (REASK_UNTIL_PASS ? "10" : "0"), 10) || 0,
+);
+// Dynamic per-provider/model prompt-mutation system (docs/prompt-adaptation/provider-prompting.md).
+// Off by default; when on, model-specific completeness augmentations are appended to the prompt.
+// Auto-enabled for non-codex models when --reask-until-pass is set (including flash-lite default).
+const _promptTraits = modelTraits({ provider: PROVIDER, model: MODEL });
+const ADAPT_PROMPT =
+  process.argv.includes("--adapt-prompt") ||
+  process.env.COMPACT_ADAPT_PROMPT === "1" ||
+  (REASK_UNTIL_PASS && !_promptTraits.isStrong);
+const DENSITY_THRESHOLDS = {
+  minEvidenceCapsules: intArg("--min-evidence-capsules", DEFAULT_DENSITY_THRESHOLDS.minEvidenceCapsules),
+  minCitedLines: intArg("--min-cited-lines", DEFAULT_DENSITY_THRESHOLDS.minCitedLines),
+  minPromises: intArg("--min-promises", DEFAULT_DENSITY_THRESHOLDS.minPromises),
+};
+// Required-literal targeting for the reask loop. When --fixture (or COMPACT_FIXTURE)
+// points at a scorer fixture JSON, its required_literals must all survive into the
+// rehydrated handoff; an attempt that drops one is re-requested with the missing
+// literals named, even if the density gate already passed. The scorer is the source
+// of truth, so the loop reads the same list and checks the same rehydrated text.
+// Benchmark-only knob: production never sets it, so requiredLiterals stays empty and
+// the literal gate is inert.
+const FIXTURE_PATH = argValue("--fixture", process.env.COMPACT_FIXTURE || "");
 const customSummaryInstructions = argValue("--summary-instructions", "");
 const compactAndPrompt = argValue("--compact-and", "");
 const fromOutputPath = argValue("--from-output", "");
@@ -231,8 +369,8 @@ const transcriptRenderer = argValue(
   "--transcript-renderer",
   process.env.COMPACT_TRANSCRIPT_RENDERER || "stripped"
 );
-if (transcriptRenderer !== "stripped" && transcriptRenderer !== "sentinel" && transcriptRenderer !== "jsonl") {
-  throw new Error("Expected --transcript-renderer to be stripped, sentinel, or jsonl");
+if (transcriptRenderer !== "stripped" && transcriptRenderer !== "sentinel" && transcriptRenderer !== "jsonl" && transcriptRenderer !== "onto") {
+  throw new Error("Expected --transcript-renderer to be stripped, sentinel, jsonl, or onto");
 }
 const toolOutputCompressAfter =
   argValue("--tool-output-compress-after") === undefined
@@ -250,6 +388,50 @@ const toolOutputCompressTailChars =
   argValue("--tool-output-compress-tail-chars") === undefined
     ? intArg("--sentinel-old-tool-output-tail-chars", 500)
     : intArg("--tool-output-compress-tail-chars", 500);
+// Old tool-output compression strategy. "headtail" keeps a fixed head+tail window
+// (the original blind heuristic); "dspc" selects content by importance using the
+// DSPC two-stage pipeline (arXiv:2509.13723): coarse TF-IDF sentence filtering,
+// then a multi-signal score. The two model-derived signals in the paper
+// (last-layer attention, cross-model loss) are realized as deterministic lexical
+// proxies here because this renderer/compression path makes zero model calls;
+// the positional Gaussian (eq. 9) is computed exactly. "mask" is full observation
+// masking (arXiv:2508.21433): drop the old tool-output body entirely, keeping only
+// a metadata placeholder (the body stays recoverable via the sha markers).
+const toolOutputCompressStrategy = argValue(
+  "--tool-output-compress-strategy",
+  process.env.COMPACT_TOOL_OUTPUT_STRATEGY || "headtail"
+);
+if (!["headtail", "dspc", "mask"].includes(toolOutputCompressStrategy)) {
+  throw new Error("Expected --tool-output-compress-strategy to be headtail, dspc, or mask");
+}
+const toolUseCompressAfter =
+  argValue("--tool-use-compress-after") === undefined
+    ? toolOutputCompressAfter
+    : intArg("--tool-use-compress-after", toolOutputCompressAfter);
+const toolUseCompressMinChars = intArg("--tool-use-compress-min-chars", 800);
+const toolUseCompressHeadChars = intArg("--tool-use-compress-head-chars", 400);
+const toolUseCompressTailChars = intArg("--tool-use-compress-tail-chars", 200);
+const transcriptCwdPrefix = argValue(
+  "--transcript-cwd-prefix",
+  process.env.COMPACT_TRANSCRIPT_CWD_PREFIX || ""
+);
+function floatArg(name, fallback) {
+  const raw = argValue(name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed)) {
+    throw new Error("Expected " + name + " to be a finite number");
+  }
+  return parsed;
+}
+// DSPC hyperparameters. Defaults follow the paper's best configuration
+// (Stage-1 ratio rho=0.7; beta weights 0.6/0.3/0.1 for salience/informativeness/position).
+const dspcStage1Ratio = floatArg("--dspc-stage1-ratio", 0.7);
+const dspcBetaAttn = floatArg("--dspc-beta-attn", 0.6);
+const dspcBetaLoss = floatArg("--dspc-beta-loss", 0.3);
+const dspcBetaPos = floatArg("--dspc-beta-pos", 0.1);
+const dspcPosLambda = floatArg("--dspc-pos-lambda", 1.0);
+const dspcPosSigmaFrac = floatArg("--dspc-pos-sigma-frac", 0.25);
 const startedAt = new Date();
 const defaultOutDir = join(
   "runs",
@@ -334,6 +516,23 @@ function previewRecord(line) {
   }
 }
 
+function toolFormatMeta(entry) {
+  return {
+    lineNumber: entry?.lineNumber ?? null,
+    recordHash: entry?.hash ?? null,
+    cwdPrefix: transcriptCwdPrefix || null,
+  };
+}
+
+function renderPartForPrompt(part, meta = {}) {
+  if (!part || typeof part !== "object") return "";
+  if (part.type === "tool_use") return formatToolUse(part, meta);
+  if (part.type === "tool_result") return formatToolResult(part, meta);
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.content === "string") return part.content;
+  return "";
+}
+
 // Codex rollout records nest text under .payload (response_item / event_msg), not the Claude
 // shape. Extract user/assistant/tool text so a Codex transcript is both citable and renderable.
 function codexPayloadText(record) {
@@ -397,43 +596,12 @@ function atifToClaudeJsonl(raw) {
   return lines.length > 0 ? lines.join("\n") + "\n" : null;
 }
 
-function renderPartForPrompt(part) {
-  if (!part || typeof part !== "object") return "";
-  if (typeof part.text === "string") return part.text;
-  if (typeof part.content === "string") return part.content;
-  if (part.type === "tool_use") {
-    const name = part.name || "unknown";
-    const input =
-      part.input && typeof part.input === "object" ? JSON.stringify(part.input) : String(part.input || "");
-    return "[tool_use name=" + name + "]\n" + input;
-  }
-  if (part.type === "tool_result") {
-    const content = Array.isArray(part.content)
-      ? part.content
-          .map((item) =>
-            typeof item === "string"
-              ? item
-              : typeof item?.text === "string"
-                ? item.text
-                : typeof item?.content === "string"
-                  ? item.content
-                  : ""
-          )
-          .filter(Boolean)
-          .join("\n")
-      : typeof part.content === "string"
-        ? part.content
-        : "";
-    return "[tool_result]\n" + content;
-  }
-  return "";
-}
-
-function recordTextForPrompt(record) {
+function recordTextForPrompt(record, entry = null) {
+  const meta = toolFormatMeta(entry);
   const content = record?.message?.content ?? record?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    const rendered = content.map(renderPartForPrompt).filter(Boolean).join("\n\n");
+    const rendered = content.map((part) => renderPartForPrompt(part, meta)).filter(Boolean).join("\n\n");
     if (rendered.length > 0) return rendered;
   }
   if (typeof record?.lastPrompt === "string" && record.lastPrompt.length > 0) return record.lastPrompt;
@@ -449,6 +617,20 @@ function isToolOutputRecord(record) {
   if (record?.toolUseResult || record?.sourceToolAssistantUUID) return true;
   if (!Array.isArray(content)) return false;
   return content.some((part) => part?.type === "tool_result" || part?.tool_use_id);
+}
+
+function isToolUseRecord(record) {
+  const content = record?.message?.content;
+  return Array.isArray(content) && content.some((part) => part?.type === "tool_use");
+}
+
+function compactOldToolUseBody(body, entry) {
+  if (!isFormattedEditText(body)) return { body, compressed: false };
+  return compactFormattedEdit(body, entry, {
+    minChars: toolUseCompressMinChars,
+    headChars: toolUseCompressHeadChars,
+    tailChars: toolUseCompressTailChars,
+  });
 }
 
 function escapeSentinelBody(text) {
@@ -488,6 +670,248 @@ function compactOldToolOutputBody(body, entry) {
   };
 }
 
+function dspcSplitSentences(text) {
+  const segments = [];
+  for (const rawLine of String(text).split(/\n/)) {
+    if (rawLine.trim() === "") continue;
+    const parts = /[.!?]\s/.test(rawLine) ? rawLine.split(/(?<=[.!?])\s+/) : [rawLine];
+    for (const part of parts) {
+      if (part.trim() !== "") segments.push(part);
+    }
+  }
+  return segments;
+}
+
+function dspcTokenize(text) {
+  return String(text).toLowerCase().match(/[a-z0-9_]+/g) || [];
+}
+
+function dspcMax(values) {
+  let max = 0;
+  for (const value of values) if (value > max) max = value;
+  return max;
+}
+
+// DSPC (arXiv:2509.13723) deterministic realization. Stage 1 is the paper's
+// TF-IDF semantic-sentence filter (eq. 1-5). Stage 2 ranks survivors by a
+// multi-signal score (eq. 10): attention contribution and cross-model loss are
+// approximated by lexical TF-IDF salience and IDF informativeness (Rho-1
+// intuition) because this path makes no model calls, while positional importance
+// (eq. 9) is computed exactly. The exact body stays recoverable downstream via
+// the body_sha256/record_sha256 in the marker, so the prompt-side loss is safe.
+function compactOldToolOutputBodyDSPC(body, entry) {
+  const text = String(body || "");
+  if (text.length <= toolOutputCompressMinChars) return { body: text, compressed: false };
+  const budget = Math.max(toolOutputCompressHeadChars + toolOutputCompressTailChars, 1);
+
+  const segments = dspcSplitSentences(text);
+  const N = segments.length;
+  if (N <= 1) return compactOldToolOutputBody(body, entry);
+  const segTokens = segments.map(dspcTokenize);
+
+  const df = new Map();
+  for (const toks of segTokens) {
+    for (const term of new Set(toks)) df.set(term, (df.get(term) || 0) + 1);
+  }
+  // Plain inverse document frequency (paper eq. 1: TF * log(N/DF)). No smoothing:
+  // a term in every segment scores 0 (uninformative), so repeated boilerplate is
+  // down-weighted instead of dominating via raw term frequency.
+  const idf = (term) => Math.log(N / (df.get(term) || 1));
+
+  const globalTf = new Map();
+  for (const toks of segTokens) {
+    for (const term of toks) globalTf.set(term, (globalTf.get(term) || 0) + 1);
+  }
+  const globalScore = new Map();
+  for (const [term, tf] of globalTf) globalScore.set(term, tf * idf(term));
+  const queryTerms = new Set(
+    [...globalScore.entries()]
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+      .slice(0, Math.min(12, globalScore.size))
+      .map(([term]) => term)
+  );
+
+  const stage1Score = segTokens.map((toks) => {
+    if (toks.length === 0) return 0;
+    let score = 0;
+    for (const term of toks) if (queryTerms.has(term)) score += idf(term);
+    return score / Math.sqrt(toks.length);
+  });
+  const keepStage1 = Math.max(1, Math.floor(dspcStage1Ratio * N));
+  const stage1Idx = segments
+    .map((_, i) => i)
+    .sort((a, b) => stage1Score[b] - stage1Score[a] || a - b)
+    .slice(0, keepStage1);
+
+  const sigma = Math.max(dspcPosSigmaFrac * N, 1);
+  const rawAttn = [];
+  const rawLoss = [];
+  const rawPos = [];
+  for (let i = 0; i < N; i += 1) {
+    const toks = segTokens[i];
+    const denom = toks.length || 1;
+    let salience = 0;
+    let informativeness = 0;
+    for (const term of toks) {
+      salience += globalScore.get(term) || 0;
+      informativeness += idf(term);
+    }
+    rawAttn.push(salience / denom);
+    rawLoss.push(informativeness / denom);
+    rawPos.push(1 + dspcPosLambda * Math.exp(-(((i - N / 2) ** 2) / (2 * sigma * sigma))));
+  }
+  const normalize = (arr) => {
+    const max = dspcMax(arr);
+    return max > 0 ? arr.map((x) => x / max) : arr.map(() => 0);
+  };
+  const nAttn = normalize(rawAttn);
+  const nLoss = normalize(rawLoss);
+  const alpha = segments.map(
+    (_, i) => dspcBetaAttn * nAttn[i] + dspcBetaLoss * nLoss[i] + dspcBetaPos * rawPos[i]
+  );
+
+  const ranked = stage1Idx.slice().sort((a, b) => alpha[b] - alpha[a] || a - b);
+  const selected = new Set();
+  let used = 0;
+  for (const i of ranked) {
+    const cost = segments[i].length + 1;
+    if (selected.size > 0 && used + cost > budget) continue;
+    selected.add(i);
+    used += cost;
+    if (used >= budget) break;
+  }
+
+  const keptOrdered = [...selected].sort((a, b) => a - b);
+  const pieces = [];
+  let prev = -1;
+  for (const i of keptOrdered) {
+    if (prev !== -1 && i > prev + 1) pieces.push("[...]");
+    pieces.push(segments[i]);
+    prev = i;
+  }
+  if (keptOrdered.length && keptOrdered[0] > 0) pieces.unshift("[...]");
+  if (keptOrdered.length && keptOrdered[keptOrdered.length - 1] < N - 1) pieces.push("[...]");
+  const kept = pieces.join("\n");
+  const omitted = Math.max(text.length - kept.length, 0);
+  const marker =
+    "[tool output compressed: strategy=dspc original_chars=" +
+    text.length +
+    " omitted_chars=" +
+    omitted +
+    " line=" +
+    entry.lineNumber +
+    " body_sha256=" +
+    sha256Text(text) +
+    " record_sha256=" +
+    entry.hash +
+    " stage1_kept=" +
+    keepStage1 +
+    "/" +
+    N +
+    " stage2_kept=" +
+    keptOrdered.length +
+    "]";
+  return {
+    body: [marker, "", kept].join("\n"),
+    compressed: true,
+    originalChars: text.length,
+    omittedChars: omitted,
+  };
+}
+
+// Observation masking (JetBrains "The Complexity Trap", arXiv:2508.21433): drop the
+// entire old tool-output body, keeping only a metadata placeholder. The exact body
+// stays recoverable downstream via body_sha256/record_sha256, same as headtail/dspc.
+function maskOldToolOutputBody(body, entry) {
+  const text = String(body || "");
+  if (text.length <= toolOutputCompressMinChars) return { body: text, compressed: false };
+  const lines = text.split("\n").length;
+  const marker =
+    "[tool output masked: strategy=mask original_chars=" +
+    text.length +
+    " original_lines=" +
+    lines +
+    " omitted_chars=" +
+    text.length +
+    " line=" +
+    entry.lineNumber +
+    " body_sha256=" +
+    sha256Text(text) +
+    " record_sha256=" +
+    entry.hash +
+    "]";
+  return { body: marker, compressed: true, originalChars: text.length, omittedChars: text.length };
+}
+
+function compactToolOutputBody(body, entry) {
+  if (toolOutputCompressStrategy === "mask") return maskOldToolOutputBody(body, entry);
+  if (toolOutputCompressStrategy === "dspc") return compactOldToolOutputBodyDSPC(body, entry);
+  return compactOldToolOutputBody(body, entry);
+}
+
+function escapeOntoBody(text) {
+  return String(text || "").replace(/^(\d{6}\|)/gm, " $1");
+}
+
+function ontoMetaField(value) {
+  return String(value == null ? "" : value).replace(/\s+/g, "_").replace(/\|/g, "/");
+}
+
+// ONTO-inspired schema-once row-major renderer (arXiv:2604.17512). Per-record
+// metadata keys (line|type|role|ts|chars) are declared once in the @@ONTO header;
+// each record is one pipe-delimited value row (empty fields render as ONTO null)
+// followed by its free-text body. Row-major (not the paper's column-major field
+// lines) preserves the per-record line anchor the scorer/rehydrator depend on.
+// Drops per-record key= repetition used by sentinel and stripped. A record starts
+// at ^\d{6}\|; body lines that would collide are space-escaped.
+function renderOntoRecord(entry, context) {
+  const linePadded = String(entry.lineNumber).padStart(6, "0");
+  let record;
+  try {
+    record = JSON.parse(entry.raw);
+  } catch {
+    const body = escapeOntoBody(entry.raw);
+    return linePadded + "|unparsed|||" + body.length + "\n" + body;
+  }
+  const type = ontoMetaField(record.type || "unknown");
+  const role = record.message?.role ? ontoMetaField(record.message.role) : "";
+  const ts = record.timestamp ? ontoMetaField(record.timestamp) : "";
+  let body = recordTextForPrompt(record, entry).trim() || entry.preview || "[no textual content extracted]";
+  const oldToolOutput =
+    isToolOutputRecord(record) &&
+    toolOutputCompressAfter > 0 &&
+    entry.lineNumber <= context.recordCount - toolOutputCompressAfter;
+  if (oldToolOutput) {
+    const compacted = compactToolOutputBody(body, entry);
+    if (compacted.compressed) {
+      context.stats.compressedToolOutputRecords += 1;
+      context.stats.originalToolOutputChars += compacted.originalChars;
+      context.stats.omittedToolOutputChars += compacted.omittedChars;
+    }
+    body = compacted.body;
+  }
+  const oldToolUse =
+    isToolUseRecord(record) &&
+    toolUseCompressAfter > 0 &&
+    entry.lineNumber <= context.recordCount - toolUseCompressAfter;
+  if (oldToolUse) {
+    const compacted = compactOldToolUseBody(body, entry);
+    if (compacted.compressed) {
+      context.stats.compressedToolUseRecords = (context.stats.compressedToolUseRecords || 0) + 1;
+      context.stats.originalToolUseChars = (context.stats.originalToolUseChars || 0) + compacted.originalChars;
+      context.stats.omittedToolUseChars = (context.stats.omittedToolUseChars || 0) + compacted.omittedChars;
+    }
+    body = compacted.body;
+  }
+  body = escapeOntoBody(body);
+  if (oldToolOutput) context.stats.renderedToolOutputChars += body.length;
+  return [linePadded, type, role, ts, String(body.length)].join("|") + "\n" + body;
+}
+
+function ontoHeader(recordCount) {
+  return "@@ONTO Transcript[" + recordCount + "] fields=line|type|role|ts|chars";
+}
+
 function renderStrippedRecord(entry) {
   let record;
   try {
@@ -507,7 +931,7 @@ function renderStrippedRecord(entry) {
   ];
   if (record.message?.role) attrs.push('role="' + String(record.message.role).replace(/"/g, "'") + '"');
   if (record.timestamp) attrs.push('timestamp="' + String(record.timestamp).replace(/"/g, "'") + '"');
-  const text = recordTextForPrompt(record).trim();
+  const text = recordTextForPrompt(record, entry).trim();
   const body = text || entry.preview || "[no textual content extracted]";
   return "<record " + attrs.join(" ") + ">\n" + body + "\n</record>";
 }
@@ -526,15 +950,28 @@ function renderSentinelRecord(entry, context) {
   ];
   if (record.message?.role) fields.push("role=" + String(record.message.role).replace(/\s+/g, "_"));
   if (record.timestamp) fields.push("ts=" + String(record.timestamp).replace(/\s+/g, "_"));
-  let body = recordTextForPrompt(record).trim() || entry.preview || "[no textual content extracted]";
+  let body = recordTextForPrompt(record, entry).trim() || entry.preview || "[no textual content extracted]";
   const oldToolOutput =
     isToolOutputRecord(record) && toolOutputCompressAfter > 0 && entry.lineNumber <= context.recordCount - toolOutputCompressAfter;
   if (oldToolOutput) {
-    const compacted = compactOldToolOutputBody(body, entry);
+    const compacted = compactToolOutputBody(body, entry);
     if (compacted.compressed) {
       context.stats.compressedToolOutputRecords += 1;
       context.stats.originalToolOutputChars += compacted.originalChars;
       context.stats.omittedToolOutputChars += compacted.omittedChars;
+    }
+    body = compacted.body;
+  }
+  const oldToolUse =
+    isToolUseRecord(record) &&
+    toolUseCompressAfter > 0 &&
+    entry.lineNumber <= context.recordCount - toolUseCompressAfter;
+  if (oldToolUse) {
+    const compacted = compactOldToolUseBody(body, entry);
+    if (compacted.compressed) {
+      context.stats.compressedToolUseRecords = (context.stats.compressedToolUseRecords || 0) + 1;
+      context.stats.originalToolUseChars = (context.stats.originalToolUseChars || 0) + compacted.originalChars;
+      context.stats.omittedToolUseChars = (context.stats.omittedToolUseChars || 0) + compacted.omittedChars;
     }
     body = compacted.body;
   }
@@ -551,6 +988,9 @@ function buildRecordArtifacts(transcript, renderer = transcriptRenderer) {
     originalToolOutputChars: 0,
     renderedToolOutputChars: 0,
     omittedToolOutputChars: 0,
+    compressedToolUseRecords: 0,
+    originalToolUseChars: 0,
+    omittedToolUseChars: 0,
   };
   const entries = lines.map((line, idx) => {
     let searchableText = line;
@@ -575,7 +1015,7 @@ function buildRecordArtifacts(transcript, renderer = transcriptRenderer) {
       searchableText,
     };
   });
-  const wrappedTranscript =
+  const wrappedBody =
     entries
       .map((entry) => {
         const line = String(entry.lineNumber).padStart(6, "0");
@@ -583,9 +1023,14 @@ function buildRecordArtifacts(transcript, renderer = transcriptRenderer) {
         if (renderer === "sentinel") {
           return renderSentinelRecord(entry, { recordCount: entries.length, stats: renderStats });
         }
+        if (renderer === "onto") {
+          return renderOntoRecord(entry, { recordCount: entries.length, stats: renderStats });
+        }
         return '<record line="' + line + '">' + entry.raw + "</record>";
       })
       .join("\n") + "\n";
+  const wrappedTranscript =
+    renderer === "onto" ? ontoHeader(entries.length) + "\n" + wrappedBody : wrappedBody;
   const tsv =
     "line\thash\tpreview\n" +
     entries
@@ -708,6 +1153,7 @@ function renderEntryForStats(entry, renderer, context) {
   const line = String(entry.lineNumber).padStart(6, "0");
   if (renderer === "stripped") return renderStrippedRecord(entry);
   if (renderer === "sentinel") return renderSentinelRecord(entry, context);
+  if (renderer === "onto") return renderOntoRecord(entry, context);
   return '<record line="' + line + '">' + entry.raw + "</record>";
 }
 
@@ -728,6 +1174,9 @@ function rendererStatsForTranscript(transcript, renderer) {
     originalToolOutputChars: 0,
     renderedToolOutputChars: 0,
     omittedToolOutputChars: 0,
+    compressedToolUseRecords: 0,
+    originalToolUseChars: 0,
+    omittedToolUseChars: 0,
   };
   for (const entry of entries) {
     let record = null;
@@ -812,11 +1261,11 @@ function rendererStatsForTranscript(transcript, renderer) {
       hash: entry.hash.slice(0, 12),
       preview: entry.preview,
     });
-    if (renderer === "sentinel" && parsed && isToolOutputRecord(record)) {
+    if ((renderer === "sentinel" || renderer === "onto") && parsed && isToolOutputRecord(record)) {
       const body = recordTextForPrompt(record).trim() || entry.preview || "[no textual content extracted]";
       const oldToolOutput =
         toolOutputCompressAfter > 0 && entry.lineNumber <= entries.length - toolOutputCompressAfter;
-      const compacted = oldToolOutput ? compactOldToolOutputBody(body, entry) : { compressed: false };
+      const compacted = oldToolOutput ? compactToolOutputBody(body, entry) : { compressed: false };
       if (compacted.compressed) {
         topOmitted.push({
           line: entry.lineNumber,
@@ -1291,7 +1740,8 @@ function createSummarySchema(recordCount = 0, options = {}) {
   };
   const lineNumber = {
     type: "integer",
-    description: "One-based logical JSONL record number from the <record line=...> wrapper.",
+    description:
+      "One-based logical JSONL record number for the cited record, read from the transcript framing described in the prompt.",
   };
   if (includeLineBounds) {
     lineNumber.minimum = 1;
@@ -1322,6 +1772,8 @@ function createSummarySchema(recordCount = 0, options = {}) {
       summary_blocks: {
         type: "array",
         minItems: 1,
+        description:
+          "One thematic section per distinct domain of the session. Be exhaustive: emit a separate block for every domain touched (current state, current user intent and constraints, each active artifact area, transport/capture, endpoints/payloads, model registry, tooling/skills, decisions, and pending work). Many focused blocks beat a few broad ones; do not merge unrelated domains into a single block. This handoff outlives the transcript, so a domain you omit is lost.",
         items: {
           type: "object",
           additionalProperties: false,
@@ -1340,6 +1792,8 @@ function createSummarySchema(recordCount = 0, options = {}) {
             source_spans: {
               type: "array",
               minItems: 1,
+              description:
+                "Cite MULTIPLE narrow record ranges that support this block -- one fact per span. Prefer several 1-3 record citations over one wide span; every verbatim path, protocol string, RPC/service name, command, or version number named in the body needs its own span. A block with a single span almost always collapsed several facts.",
               items: sourceSpan,
             },
           },
@@ -1394,7 +1848,7 @@ function createSummarySchema(recordCount = 0, options = {}) {
       promises_made: {
         type: "array",
         description:
-          "Explicit assistant commitments to the user that should survive compaction. Include promises such as 'I will run X', 'I will send Y', 'I will update/commit/push Z', or equivalent accepted commitments where the user will reasonably expect follow-through or proof. Do not infer promises from a user request alone. Exclude ordinary plans, inferred next steps, and completed work unless its promised proof/status must remain visible.",
+          "Explicit assistant commitments to the user that should survive compaction. Include promises such as 'I will run X', 'I will send Y', 'I will update/commit/push Z', or equivalent accepted commitments where the user will reasonably expect follow-through or proof. Scan the WHOLE transcript for these commitments and include every one with a source_span -- this array is commonly under-populated, so re-check it before finalizing rather than leaving it empty when commitments exist. Do not infer promises from a user request alone. Exclude ordinary plans, inferred next steps, and completed work unless its promised proof/status must remain visible.",
         items: {
           type: "object",
           additionalProperties: false,
@@ -1413,8 +1867,16 @@ function createSummarySchema(recordCount = 0, options = {}) {
           },
         },
       },
-      current_work: { type: "string" },
-      optional_next_step: { type: "string" },
+      current_work: {
+        type: "string",
+        description:
+          "What is actively in progress at the END of the transcript (not an earlier abandoned branch), in one or two concrete sentences: the specific task, the file or command in flight, and the immediate blocker or open decision. Name exact paths/commands/identifiers.",
+      },
+      optional_next_step: {
+        type: "string",
+        description:
+          "The single most actionable next step a fresh agent should take, stated as a concrete action grounded in the latest transcript state -- ideally the exact next command, file to edit, or check to run, and why. Do not leave empty and do not restate the goal abstractly; if work is complete, say what verification or follow-up remains.",
+      },
       source_integrity: {
         type: "object",
         additionalProperties: false,
@@ -1461,12 +1923,10 @@ function createSummarySchema(recordCount = 0, options = {}) {
   return schema;
 }
 
-function createProviderSummarySchema(provider, recordCount = 0) {
+function createProviderSummarySchema(recordCount = 0) {
   return createSummarySchema(recordCount, {
     includeCompatibilityFields: false,
-    // Amazon Bedrock structured outputs reject numerical constraints such as
-    // minimum/maximum. Keep line bounds as local validation only for Mantle.
-    includeLineBounds: provider !== "mantle",
+    includeLineBounds: true,
   });
 }
 
@@ -1480,20 +1940,10 @@ function createLocalValidationSpec() {
 }
 
 function rendererEvidenceInstructions(renderer) {
-  if (renderer === "sentinel") {
-    return [
-      "- The transcript is wrapped as sentinel records beginning with @@RECORD line=000001 ... and ending with @@END_RECORD line=000001.",
-      "- Use one-based logical JSONL record numbers from the @@RECORD sentinel line for every source span.",
-      "- Some older tool-output records may be body-compressed with an explicit sha256 marker; cite the record line when that compressed output matters, because the harness rehydrates exact content from the source JSONL.",
-    ];
-  }
-  return [
-    '- The transcript is wrapped as <record line="000001">...</record>.',
-    "- Use one-based logical JSONL record numbers from those wrappers for every source span.",
-  ];
+  return rendererTranscriptGuide(renderer);
 }
 
-function buildFullTranscriptPrompt({ wrappedTranscript, stats }) {
+function buildFullTranscriptPrompt({ wrappedTranscript, stats, reaskFeedback, adaptationLines }) {
   const customInstructionsBlock = customSummaryInstructions.trim()
     ? [
         "",
@@ -1577,6 +2027,12 @@ function buildFullTranscriptPrompt({ wrappedTranscript, stats }) {
     "<transcript>",
     wrappedTranscript,
     "</transcript>",
+    ...(adaptationLines && adaptationLines.length
+      ? ["", "=== MODEL-SPECIFIC COMPLETENESS REQUIREMENTS ===", ...adaptationLines]
+      : []),
+    ...(reaskFeedback && reaskFeedback.trim()
+      ? ["", "=== CORRECTION REQUIRED (your previous attempt was incomplete) ===", reaskFeedback.trim()]
+      : []),
   ].join("\n");
 }
 
@@ -1634,13 +2090,13 @@ function buildCodexRequestBody(promptText, stats) {
       stream: true,
       include: ["reasoning.encrypted_content"],
       service_tier: SERVICE_TIER,
-      prompt_cache_key: "claudecompact-full-" + stats.sha256.slice(0, 32),
+      prompt_cache_key: "unifusion-full-" + stats.sha256.slice(0, 32),
       text: {
         format: {
           type: "json_schema",
           strict: true,
           name: "claude_full_transcript_compaction",
-          schema: createProviderSummarySchema(PROVIDER, stats.records),
+          schema: createProviderSummarySchema(stats.records),
         },
       },
       client_metadata: {
@@ -1648,7 +2104,7 @@ function buildCodexRequestBody(promptText, stats) {
         "x-codex-window-id": windowId,
         session_id: sessionId,
         thread_id: threadId,
-        codex_harness: "claudecompact-patcher",
+        codex_harness: "unifusion",
         request_kind: "full_transcript_compaction",
         transcript_sha256: stats.sha256,
         transcript_records: String(stats.records),
@@ -1681,7 +2137,7 @@ function geminiThinkingConfig(model, requestedLevel) {
 function buildGeminiRequestBody(promptText, stats) {
   const generationConfig = {
     responseMimeType: "application/json",
-    responseJsonSchema: createProviderSummarySchema(PROVIDER, stats.records),
+    responseJsonSchema: createProviderSummarySchema(stats.records),
   };
   const thinkingConfig = geminiThinkingConfig(MODEL, GEMINI_THINKING_LEVEL);
   if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
@@ -1710,7 +2166,7 @@ function buildGeminiRequestBody(promptText, stats) {
 }
 
 function buildChatCompletionsRequestBody(promptText, stats) {
-  const schema = createProviderSummarySchema(PROVIDER, stats.records);
+  const schema = createProviderSummarySchema(stats.records);
   const request = {
     body: {
       model: MODEL,
@@ -1733,12 +2189,13 @@ function buildChatCompletionsRequestBody(promptText, stats) {
         type: "json_schema",
         json_schema: {
           name: "claude_full_transcript_compaction",
+          description: "Produce an evidence-grounded Claude Code transcript continuation handoff.",
           strict: true,
           schema,
         },
       },
       metadata: {
-        codex_harness: "claudecompact-patcher",
+        codex_harness: "unifusion",
         request_kind: "full_transcript_compaction",
         transcript_sha256: stats.sha256,
         transcript_records: String(stats.records),
@@ -1748,26 +2205,22 @@ function buildChatCompletionsRequestBody(promptText, stats) {
   if (TEMPERATURE !== null) {
     request.body.temperature = TEMPERATURE;
   }
+  if (CHAT_REASONING_EFFORT) {
+    request.body.reasoning_effort = CHAT_REASONING_EFFORT;
+  }
   return request;
 }
 
 function buildRequestBody(promptText, stats) {
-  if (PROVIDER === "gemini") return buildGeminiRequestBody(promptText, stats);
-  if (PROVIDER === "xai" || PROVIDER === "mantle") return buildChatCompletionsRequestBody(promptText, stats);
+  const family = PROVIDER_REGISTRY[PROVIDER].family;
+  if (family === "gemini") return buildGeminiRequestBody(promptText, stats);
+  if (family === "chat") return buildChatCompletionsRequestBody(promptText, stats);
   return buildCodexRequestBody(promptText, stats);
 }
 
 function providerEndpoint() {
-  if (PROVIDER === "gemini") {
-    return (
-      GEMINI_API_BASE_URL.replace(/\/$/, "") +
-      "/models/" +
-      encodeURIComponent(MODEL) +
-      ":streamGenerateContent?alt=sse"
-    );
-  }
-  if (PROVIDER === "xai") return XAI_API_BASE_URL.replace(/\/$/, "") + "/chat/completions";
-  if (PROVIDER === "mantle") return MANTLE_CHAT_COMPLETIONS_URL;
+  const reg = PROVIDER_REGISTRY[PROVIDER];
+  if (reg.endpoint) return reg.endpoint();
   return CODEX_RESPONSES_URL;
 }
 
@@ -1879,10 +2332,9 @@ function redactChatCompletionsRequestForLog(request, stats) {
 }
 
 function redactRequestForLog(request, stats) {
-  if (PROVIDER === "gemini") return redactGeminiRequestForLog(request, stats);
-  if (PROVIDER === "xai" || PROVIDER === "mantle") {
-    return redactChatCompletionsRequestForLog(request, stats);
-  }
+  const family = PROVIDER_REGISTRY[PROVIDER].family;
+  if (family === "gemini") return redactGeminiRequestForLog(request, stats);
+  if (family === "chat") return redactChatCompletionsRequestForLog(request, stats);
   return redactCodexRequestForLog(request, stats);
 }
 
@@ -1995,7 +2447,8 @@ function collectChatCompletionsOutputText(events) {
 }
 
 function streamAdapter() {
-  if (PROVIDER === "gemini") {
+  const family = PROVIDER_REGISTRY[PROVIDER].family;
+  if (family === "gemini") {
     return {
       deltaText: geminiDeltaText,
       collectOutputText: collectGeminiOutputText,
@@ -2007,7 +2460,7 @@ function streamAdapter() {
       responseId: () => null,
     };
   }
-  if (PROVIDER === "xai" || PROVIDER === "mantle") {
+  if (family === "chat") {
     return {
       deltaText: chatCompletionsDeltaText,
       collectOutputText: collectChatCompletionsOutputText,
@@ -2325,17 +2778,15 @@ function validateSummary(value, lineHashArtifacts) {
   return null;
 }
 
-function normalizeLegacySummary(summary) {
-  let ruleStatusDefaulted = 0;
-  let promisesMadeDefaulted = 0;
+// Coerce summary blocks that cannot pass local validation as-is into a
+// paragraph: code_block format is not accepted, and a "bullet" body with a
+// leading marker or an embedded newline is not a single bullet item. Strict
+// provider schemas cannot enforce these string-content rules, so the model can
+// legitimately return such a block; coercing here keeps one malformed block
+// from aborting the whole run. Idempotent: re-running finds nothing to relax.
+function relaxSummaryBlockFormats(summary) {
   let bulletFormatRelaxed = 0;
   let codeBlockDowngraded = 0;
-  for (const item of summary.rules_and_invariants || []) {
-    if (typeof item.status !== "string") {
-      item.status = "current";
-      ruleStatusDefaulted += 1;
-    }
-  }
   for (const item of summary.summary_blocks || []) {
     if (item?.format === "code_block") {
       item.format = "paragraph";
@@ -2351,6 +2802,19 @@ function normalizeLegacySummary(summary) {
       bulletFormatRelaxed += 1;
     }
   }
+  return { bulletFormatRelaxed, codeBlockDowngraded };
+}
+
+function normalizeLegacySummary(summary) {
+  let ruleStatusDefaulted = 0;
+  let promisesMadeDefaulted = 0;
+  for (const item of summary.rules_and_invariants || []) {
+    if (typeof item.status !== "string") {
+      item.status = "current";
+      ruleStatusDefaulted += 1;
+    }
+  }
+  const { bulletFormatRelaxed, codeBlockDowngraded } = relaxSummaryBlockFormats(summary);
   if (!Array.isArray(summary.promises_made)) {
     summary.promises_made = [];
     promisesMadeDefaulted = 1;
@@ -2472,6 +2936,10 @@ function deriveCompatibilityFields(summary) {
 }
 
 function normalizeDerivedSummaryFields(summary) {
+  // Relax non-conforming block formats before validation. This runs on every
+  // response (fresh provider output and reloaded output alike), so a single
+  // multi-line bullet no longer aborts a fresh run with a hard validation fail.
+  const { bulletFormatRelaxed, codeBlockDowngraded } = relaxSummaryBlockFormats(summary);
   const compatibilityArraysDefaulted = [];
   const derived = deriveCompatibilityFields(summary);
   for (const key of COMPATIBILITY_ARRAY_KEYS) {
@@ -2482,6 +2950,8 @@ function normalizeDerivedSummaryFields(summary) {
   return {
     compatibilityArraysDefaulted,
     sourceLinesDerived: summary.source_lines_used.length,
+    bulletFormatRelaxed,
+    codeBlockDowngraded,
   };
 }
 
@@ -2508,45 +2978,42 @@ function stableJson(value) {
   }
 }
 
-function extractContentPartText(part) {
+function extractContentPartText(part, meta = {}) {
   if (!part || typeof part !== "object") return "";
+  if (part.type === "tool_use") return formatToolUse(part, meta);
+  if (part.type === "tool_result") {
+    const formatted = formatToolResultContent(part.content, { ...meta, toolName: "EditResult" });
+    return formatted ? "[tool_result]\n" + formatted : "";
+  }
   if (typeof part.text === "string") return part.text;
   if (typeof part.content === "string") return part.content;
   if (Array.isArray(part.content)) {
     const nested = part.content
-      .map((nestedPart) => extractContentPartText(nestedPart))
+      .map((nestedPart) => extractContentPartText(nestedPart, meta))
       .filter((text) => text.length > 0);
     if (nested.length > 0) return nested.join("\n\n");
   }
-  if (part.type === "tool_use") {
-    return stableJson({
-      type: part.type,
-      name: part.name || null,
-      input: part.input || null,
-    });
-  }
-  if (part.type === "tool_result") {
-    return stableJson({
-      type: part.type,
-      tool_use_id: part.tool_use_id || null,
-      content: part.content || null,
-    });
-  }
-  if (part.input && typeof part.input === "object") return stableJson(part.input);
+  if (part.input && typeof part.input === "object") return formatToolUse({ type: "tool_use", name: "unknown", input: part.input }, meta);
   return "";
 }
 
-function extractRecordText(record) {
+function extractRecordText(record, meta = {}) {
   if (!record || typeof record !== "object") return "";
   if (typeof record.content === "string") return record.content;
   if (typeof record.message?.content === "string") return record.message.content;
   if (Array.isArray(record.message?.content)) {
     const texts = record.message.content
-      .map((part) => extractContentPartText(part))
+      .map((part) => extractContentPartText(part, meta))
       .filter((text) => text.length > 0);
-    if (texts.length > 0) return texts.join("\n");
+    if (texts.length > 0) return texts.join("\n\n");
   }
-  if (record.toolUseResult) return stableJson(record.toolUseResult);
+  if (record.toolUseResult) {
+    const formatted = formatToolResultContent(
+      typeof record.toolUseResult === "string" ? record.toolUseResult : JSON.stringify(record.toolUseResult),
+      { ...meta, toolName: "EditResult" }
+    );
+    return formatted || stableJson(record.toolUseResult);
+  }
   if (record.attachment) return JSON.stringify(record.attachment, null, 2);
   if (typeof record.lastPrompt === "string" && record.lastPrompt.length > 0) return record.lastPrompt;
   if (typeof record.aiTitle === "string" && record.aiTitle.length > 0) return record.aiTitle;
@@ -2583,7 +3050,11 @@ function buildExtractedSpanText(slice, startLine) {
   let extractedText = "";
   const textSegments = [];
   for (const [idx, record] of slice.entries()) {
-    const text = extractRecordText(record);
+    const lineNumber = startLine + idx;
+    const text = extractRecordText(record, {
+      lineNumber,
+      cwdPrefix: transcriptCwdPrefix || null,
+    });
     if (text.length === 0) continue;
     if (textSegments.length > 0) extractedText += "\n\n";
     const start = extractedText.length;
@@ -2653,6 +3124,7 @@ function deriveRehydrationSpans(summary, records, lineHashArtifacts) {
         );
       }
       const codeCapsules = extractCodeCapsules(currentSpanId, extractedText, textSegments);
+      const editCapsules = extractEditCapsules(currentSpanId, extractedText);
       spans.push({
         span_id: currentSpanId,
         block_index: block.summary_block_index ?? anchoredIndex,
@@ -2666,6 +3138,7 @@ function deriveRehydrationSpans(summary, records, lineHashArtifacts) {
         char_range: [0, extractedText.length],
         text_segments: textSegments,
         code_capsules: codeCapsules,
+        edit_capsules: editCapsules,
         start_line: span.start_line,
         end_line: span.end_line,
         start_hash: lineHash(lineHashArtifacts, span.start_line),
@@ -2685,6 +3158,7 @@ function deriveRehydrationSpans(summary, records, lineHashArtifacts) {
 function renderRehydratedSummary(summary, spans) {
   const lines = [summary.summary_markdown.trim(), "", "## Rehydration Spans"];
   for (const span of spans) {
+    const editCount = (span.edit_capsules || []).length;
     lines.push(
       "- " +
         span.span_id +
@@ -2699,9 +3173,12 @@ function renderRehydratedSummary(summary, spans) {
         "-" +
         span.char_range[1] +
         " | code capsules " +
-        (span.code_capsules || []).length
+        (span.code_capsules || []).length +
+        (editCount ? " | edit capsules " + editCount : "")
     );
-    lines.push("```");
+    const fenceLang =
+      isFormattedEditText(span.extracted_text) || /@@tool EditResult/.test(span.extracted_text) ? "diff" : "";
+    lines.push("```" + fenceLang);
     lines.push(span.extracted_text.replace(/\n$/, ""));
     lines.push("```");
     for (const code of span.code_capsules || []) {
@@ -2716,6 +3193,20 @@ function renderRehydratedSummary(summary, spans) {
           code.char_range[1] +
           " | exact_sha256 " +
           code.exact_text_sha256
+      );
+    }
+    for (const edit of span.edit_capsules || []) {
+      lines.push(
+        "- edit " +
+          edit.id +
+          " | " +
+          edit.file_path +
+          " | +" +
+          edit.lines_added +
+          " -" +
+          edit.lines_removed +
+          " | diff_sha256 " +
+          edit.diff_sha256
       );
     }
     lines.push("");
@@ -3232,6 +3723,7 @@ function extractEvidenceLiteralIndex(rehydratedSpans, limit = 128) {
     },
     { cap: 28, values: collectEvidenceLiterals(rehydratedSpans, /\b[A-Z][A-Z0-9_]{2,}\b/g) },
     { cap: 16, values: collectEvidenceLiterals(rehydratedSpans, /\b[a-z]+\/[a-z0-9.+-]+\b/g) },
+    { cap: 48, values: collectEvidenceLiterals(rehydratedSpans, /^@@file ([^\n]+)$/gm) },
     {
       cap: 48,
       values: collectEvidenceLiterals(
@@ -3264,15 +3756,25 @@ function renderHandoffMarkdown({ state, handoffUserMessageSelection, rehydratedS
     "",
   ];
 
+  // Always surface the continuation anchor (current objective + next step) at the top
+  // of the handoff. These come from canonical state (active_state), which the model
+  // populates at every thinking level. Previously they rendered ONLY when
+  // summary_markdown was empty (never, in practice), so the rendered handoff a fresh
+  // agent -- and the semantic judge -- actually reads never showed the next step; the
+  // judge scores next_step_actionability on the Handoff section and marks a next step
+  // present in ground truth but missing from the handoff as "absent".
+  if (state.active_state?.current_objective) {
+    lines.push("## Current Work", "");
+    lines.push(state.active_state.current_objective);
+    lines.push("");
+  }
+  if (state.active_state?.next_step) {
+    lines.push("## Next Step", "");
+    lines.push(state.active_state.next_step);
+    lines.push("");
+  }
   if (state.summary_markdown.trim()) {
     lines.push(state.summary_markdown.trim());
-    lines.push("");
-  } else {
-    lines.push("## Current Work", "");
-    lines.push(state.active_state.current_objective || "");
-    lines.push("");
-    lines.push("## Next Step", "");
-    lines.push(state.active_state.next_step || "");
     lines.push("");
   }
 
@@ -3412,12 +3914,13 @@ async function buildHandoffManifest({
       endpoint: requestMeta.endpoint,
       renderer_policy: {
         transcript_renderer: stats.transcriptRenderer,
+        tool_output_compress_strategy: toolOutputCompressStrategy,
         tool_output_compress_after: toolOutputCompressAfter,
         tool_output_compress_min_chars: toolOutputCompressMinChars,
         tool_output_compress_head_chars: toolOutputCompressHeadChars,
         tool_output_compress_tail_chars: toolOutputCompressTailChars,
       },
-      schema_fingerprint: sha256Text(JSON.stringify(createProviderSummarySchema(PROVIDER, stats.records))),
+      schema_fingerprint: sha256Text(JSON.stringify(createProviderSummarySchema(stats.records))),
       local_validation_schema: LOCAL_VALIDATION_SCHEMA,
       local_validation_fingerprint: sha256Text(JSON.stringify(createLocalValidationSpec())),
       usage: usage || null,
@@ -3760,10 +4263,10 @@ function buildCompactedTranscript({
       model: MODEL,
       transcriptRenderer,
       temperature: TEMPERATURE,
-      serviceTier: PROVIDER === "codex" ? SERVICE_TIER : null,
-      thinkingLevel: PROVIDER === "gemini" ? GEMINI_THINKING_LEVEL : null,
+      serviceTier: PROVIDER_REGISTRY[PROVIDER].family === "codex" ? SERVICE_TIER : null,
+      thinkingLevel: PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? GEMINI_THINKING_LEVEL : null,
       thinkingConfig:
-        PROVIDER === "gemini" ? geminiThinkingConfig(MODEL, GEMINI_THINKING_LEVEL) : null,
+        PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? geminiThinkingConfig(MODEL, GEMINI_THINKING_LEVEL) : null,
       sourceTranscriptSha256: stats.sha256,
     },
   };
@@ -3845,7 +4348,6 @@ async function main() {
   }
 
   const rawTranscript = await readFile(inputPath, "utf8");
-  // ATIF (Devin) JSON is normalized to Claude-shaped JSONL; Claude/Codex JSONL passes through unchanged.
   const transcript = atifToClaudeJsonl(rawTranscript) ?? rawTranscript;
   const allRecords = parseJsonl(transcript);
   // Filter the transcript to citable records before numbering. Every record the
@@ -3855,8 +4357,6 @@ async function main() {
   // line-number-as-array-index contract internally consistent.
   const citableTranscript = filterCitableTranscript(transcript);
   const records = parseJsonl(citableTranscript);
-  // Content guard: a transcript with no extractable text (wrong format / empty) yields zero citable
-  // records. Fail closed before any provider call.
   if (records.length === 0) {
     console.error(
       "[compact] transcript yielded no extractable text (" +
@@ -3866,7 +4366,27 @@ async function main() {
     process.exit(3);
   }
   const lineHashArtifacts = buildRecordArtifacts(citableTranscript);
-  // Provenance hashes the original file on disk (so the resolver sha-equality check holds for every host).
+  // Codex default-model switch, keyed on rendered transcript tokens: gpt-5.4-mini
+  // under CODEX_MODEL_TOKEN_THRESHOLD (272k), else gpt-5.4. Registry-scoped (only
+  // codex defines resolveModel) so other providers are untouched, and skipped when
+  // the model was set explicitly. Runs before any consumer of MODEL.
+  const codexResolveModel = PROVIDER_REGISTRY[PROVIDER].resolveModel;
+  if (codexResolveModel && !MODEL_EXPLICIT) {
+    const renderedTokens = await countRenderedTokens(
+      lineHashArtifacts.wrappedTranscript,
+      MODEL
+    );
+    MODEL = codexResolveModel(renderedTokens);
+    process.stderr.write(
+      "[codex model-switch] rendered_tokens=" +
+        renderedTokens +
+        " threshold=" +
+        CODEX_MODEL_TOKEN_THRESHOLD +
+        " model=" +
+        MODEL +
+        "\n"
+    );
+  }
   const sha256 = createHash("sha256").update(rawTranscript).digest("hex");
   const stats = {
     inputPath,
@@ -3892,31 +4412,42 @@ async function main() {
     console.log(JSON.stringify({ ok: true, renderer_stats_report: reportPath }, null, 2));
     return;
   }
-  const promptText = buildFullTranscriptPrompt({
+  const promptAdaptation = buildPromptAdaptations({
+    provider: PROVIDER,
+    model: MODEL,
+    renderer: transcriptRenderer,
+  });
+  let promptText = buildFullTranscriptPrompt({
     wrappedTranscript: lineHashArtifacts.wrappedTranscript,
     stats,
+    adaptationLines: ADAPT_PROMPT ? promptAdaptation.lines : [],
   });
   if (dumpPromptPath) await writeFile(resolve(dumpPromptPath), promptText);
-  const request = buildRequestBody(promptText, stats);
-  const bodyText = JSON.stringify(request.body);
+  let request = buildRequestBody(promptText, stats);
+  let bodyText = JSON.stringify(request.body);
   const endpoint = providerEndpoint();
+  const compressesToolOutput = transcriptRenderer === "sentinel" || transcriptRenderer === "onto";
   const requestMeta = {
     provider: PROVIDER,
     endpoint,
     model: MODEL,
+    ...(ADAPT_PROMPT ? { prompt_adaptations: promptAdaptation.applied } : {}),
+    reask_until_pass: REASK_UNTIL_PASS,
+    ...(REASK_UNTIL_PASS ? { reask_until_pass_source: REASK_UNTIL_PASS_SOURCE } : {}),
+    max_reasks: MAX_REASKS,
     provider_schema_fingerprint: sha256Text(
-      JSON.stringify(createProviderSummarySchema(PROVIDER, stats.records))
+      JSON.stringify(createProviderSummarySchema(stats.records))
     ),
     local_validation_schema: LOCAL_VALIDATION_SCHEMA,
     local_validation_fingerprint: sha256Text(JSON.stringify(createLocalValidationSpec())),
-    service_tier: PROVIDER === "codex" ? SERVICE_TIER : null,
-    reasoning_effort: PROVIDER === "codex" ? REASONING_EFFORT : null,
+    service_tier: PROVIDER_REGISTRY[PROVIDER].family === "codex" ? SERVICE_TIER : null,
+    reasoning_effort: PROVIDER_REGISTRY[PROVIDER].family === "codex" ? REASONING_EFFORT : null,
     temperature: TEMPERATURE,
-    thinking_level: PROVIDER === "gemini" ? GEMINI_THINKING_LEVEL : null,
+    thinking_level: PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? GEMINI_THINKING_LEVEL : null,
     thinking_config:
-      PROVIDER === "gemini" ? request.body.generationConfig?.thinkingConfig || null : null,
+      PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? request.body.generationConfig?.thinkingConfig || null : null,
     max_output_tokens:
-      PROVIDER === "gemini" && Number.isFinite(GEMINI_MAX_OUTPUT_TOKENS)
+      PROVIDER_REGISTRY[PROVIDER].family === "gemini" && Number.isFinite(GEMINI_MAX_OUTPUT_TOKENS)
         ? GEMINI_MAX_OUTPUT_TOKENS
         : null,
     inputPath,
@@ -3931,18 +4462,25 @@ async function main() {
     wrapped_transcript_estimated_tokens: Math.ceil(lineHashArtifacts.wrappedTranscript.length / 4),
     live_output: liveOutput,
     preserve_tail: preserveTailCount,
-    tool_output_compress_after: transcriptRenderer === "sentinel" ? toolOutputCompressAfter : null,
-    tool_output_compress_min_chars: transcriptRenderer === "sentinel" ? toolOutputCompressMinChars : null,
-    tool_output_compress_head_chars: transcriptRenderer === "sentinel" ? toolOutputCompressHeadChars : null,
-    tool_output_compress_tail_chars: transcriptRenderer === "sentinel" ? toolOutputCompressTailChars : null,
+    tool_output_compress_strategy: compressesToolOutput ? toolOutputCompressStrategy : null,
+    tool_output_compress_after: compressesToolOutput ? toolOutputCompressAfter : null,
+    tool_output_compress_min_chars: compressesToolOutput ? toolOutputCompressMinChars : null,
+    tool_output_compress_head_chars: compressesToolOutput ? toolOutputCompressHeadChars : null,
+    tool_output_compress_tail_chars: compressesToolOutput ? toolOutputCompressTailChars : null,
     tool_output_compressed_records:
-      transcriptRenderer === "sentinel" ? lineHashArtifacts.renderStats.compressedToolOutputRecords : null,
+      compressesToolOutput ? lineHashArtifacts.renderStats.compressedToolOutputRecords : null,
     tool_output_original_chars:
-      transcriptRenderer === "sentinel" ? lineHashArtifacts.renderStats.originalToolOutputChars : null,
+      compressesToolOutput ? lineHashArtifacts.renderStats.originalToolOutputChars : null,
     tool_output_rendered_chars:
-      transcriptRenderer === "sentinel" ? lineHashArtifacts.renderStats.renderedToolOutputChars : null,
+      compressesToolOutput ? lineHashArtifacts.renderStats.renderedToolOutputChars : null,
     tool_output_omitted_chars:
-      transcriptRenderer === "sentinel" ? lineHashArtifacts.renderStats.omittedToolOutputChars : null,
+      compressesToolOutput ? lineHashArtifacts.renderStats.omittedToolOutputChars : null,
+    tool_use_compress_after: toolUseCompressAfter,
+    tool_use_compress_min_chars: toolUseCompressMinChars,
+    tool_use_compressed_records: lineHashArtifacts.renderStats.compressedToolUseRecords || null,
+    tool_use_original_chars: lineHashArtifacts.renderStats.originalToolUseChars || null,
+    tool_use_omitted_chars: lineHashArtifacts.renderStats.omittedToolUseChars || null,
+    transcript_cwd_prefix: transcriptCwdPrefix || null,
     custom_summary_instructions: customSummaryInstructions.trim() || null,
     compact_and_prompt: compactAndPrompt.trim() || null,
     from_output: fromOutputPath ? resolve(fromOutputPath) : null,
@@ -3988,6 +4526,32 @@ async function main() {
   let events = [];
   let outputText = "";
   let loadedFromOutput = false;
+  let summary;
+  let reaskBest = null;
+  let reaskFeedback = "";
+  let requiredLiterals = [];
+  if (FIXTURE_PATH) {
+    try {
+      const fixtureJson = JSON.parse(await readFile(resolve(FIXTURE_PATH), "utf8"));
+      requiredLiterals = Array.isArray(fixtureJson.required_literals) ? fixtureJson.required_literals : [];
+      process.stderr.write(
+        "[reask literals] fixture " + resolve(FIXTURE_PATH) + " -> " + requiredLiterals.length + " required literal(s)\n"
+      );
+    } catch (error) {
+      process.stderr.write("[reask literals] could not load fixture " + FIXTURE_PATH + ": " + error.message + "\n");
+    }
+  }
+  for (let reaskAttempt = 0; ; reaskAttempt++) {
+   if (reaskAttempt > 0) {
+     promptText = buildFullTranscriptPrompt({
+       wrappedTranscript: lineHashArtifacts.wrappedTranscript,
+       stats,
+       reaskFeedback,
+       adaptationLines: ADAPT_PROMPT ? promptAdaptation.lines : [],
+     });
+     request = buildRequestBody(promptText, stats);
+     bodyText = JSON.stringify(request.body);
+   }
   if (fromOutputPath) {
     loadedFromOutput = true;
     const sourceOutputPath = resolve(fromOutputPath);
@@ -4020,33 +4584,29 @@ async function main() {
       ].join("\n")
     );
   } else {
-    if (PROVIDER === "gemini" && !GEMINI_API_KEY) {
-      throw new Error("Missing GEMINI_API_KEY or GOOGLE_API_KEY for --provider gemini");
-    }
-    if (PROVIDER === "xai" && !XAI_API_KEY) {
-      throw new Error("Missing XAI_API_KEY for --provider xai");
-    }
-    if (PROVIDER === "mantle" && !MANTLE_API_KEY) {
-      throw new Error("Missing MANTLE_API_KEY or BEDROCK_MANTLE_API_KEY for --provider mantle");
+    const _reg = PROVIDER_REGISTRY[PROVIDER];
+    if (_reg.resolveKey && !_reg.resolveKey()) {
+      throw new Error(_reg.missingKeyMsg);
     }
     process.stderr.write("sending full transcript request: " + JSON.stringify(requestMeta) + "\n");
 
+    const _family = _reg.family;
     const response =
-      PROVIDER === "gemini"
+      _family === "gemini"
         ? await fetch(endpoint, {
             method: "POST",
             headers: {
-              "x-goog-api-key": GEMINI_API_KEY,
+              "x-goog-api-key": _reg.resolveKey(),
               Accept: "text/event-stream",
               "Content-Type": "application/json",
             },
             body: bodyText,
           })
-        : PROVIDER === "xai" || PROVIDER === "mantle"
+        : _family === "chat"
           ? await fetch(endpoint, {
               method: "POST",
               headers: {
-                Authorization: "Bearer " + (PROVIDER === "xai" ? XAI_API_KEY : MANTLE_API_KEY),
+                Authorization: "Bearer " + _reg.resolveKey(),
                 Accept: "text/event-stream",
                 "Content-Type": "application/json",
               },
@@ -4129,10 +4689,27 @@ async function main() {
     }
   }
 
-  let summary;
   try {
     summary = JSON.parse(outputText);
   } catch (error) {
+    // A truncated/invalid JSON payload is recoverable when reasks remain: the usual
+    // cause is the provider cutting the output mid-string (Gemini finishReason
+    // MAX_TOKENS once thinking eats the output budget), and a fatal exit here would
+    // discard reasks that could succeed with a terser request. Reask with corrective
+    // feedback instead; only the final attempt (no reasks left) stays fatal.
+    if (!loadedFromOutput && reaskAttempt < MAX_REASKS) {
+      reaskFeedback = buildTruncationReaskFeedback(error.message);
+      process.stderr.write(
+        "reask " +
+          (reaskAttempt + 1) +
+          "/" +
+          MAX_REASKS +
+          " (output not valid JSON: " +
+          error.message +
+          "): re-requesting with corrective feedback\n"
+      );
+      continue;
+    }
     const failure = {
       ok: false,
       error: "output was not JSON: " + error.message,
@@ -4152,6 +4729,86 @@ async function main() {
     await writeFile(join(outDir, "failure.json"), JSON.stringify(failure, null, 2) + "\n");
     console.error(JSON.stringify(failure, null, 2));
     process.exit(1);
+  }
+
+  const reaskDensity =
+    loadedFromOutput || (MAX_REASKS === 0 && !REASK_UNTIL_PASS)
+      ? { pass: true, score: 1, shortfalls: [], feedback: "", metrics: {} }
+      : evaluateHandoffDensity(summary, DENSITY_THRESHOLDS);
+  // Required-literal gate: reproduce the exact rehydrated text the scorer reads
+  // (renderRehydratedSummary over derived spans) and flag any required literal that
+  // did not survive. A probe failure is treated pessimistically (all literals unmet)
+  // so an unrehydratable attempt cannot masquerade as literal-complete.
+  let missingLiterals = [];
+  if (requiredLiterals.length && !loadedFromOutput && !(MAX_REASKS === 0 && !REASK_UNTIL_PASS)) {
+    try {
+      // Reproduce the scorer's rehydrated text exactly. The scorer reads
+      // summary.rehydrated.md, which is produced post-loop as normalize ->
+      // renderSummaryBlocks (sets summary_markdown) -> renderRehydratedSummary. Run
+      // that same sequence on a CLONE so the real summary is untouched for the
+      // post-loop processing that keeps the chosen attempt.
+      const probeSummary = JSON.parse(JSON.stringify(summary));
+      normalizeDerivedSummaryFields(probeSummary);
+      probeSummary.summary_markdown = renderSummaryBlocks(probeSummary);
+      const probeSpans = deriveRehydrationSpans(probeSummary, records, lineHashArtifacts);
+      const probeRehydrated = renderRehydratedSummary(probeSummary, probeSpans);
+      missingLiterals = requiredLiterals.filter((literal) => !probeRehydrated.includes(literal));
+    } catch (error) {
+      missingLiterals = requiredLiterals.slice();
+      process.stderr.write(
+        "[reask literals] probe rehydration failed, treating literals as unmet: " + error.message + "\n"
+      );
+    }
+  }
+  const reaskPass = reaskDensity.pass && missingLiterals.length === 0;
+  const bestMissing = reaskBest ? reaskBest.missingLiterals.length : Infinity;
+  if (
+    !reaskBest ||
+    missingLiterals.length < bestMissing ||
+    (missingLiterals.length === bestMissing && reaskDensity.score >= reaskBest.density.score)
+  ) {
+    reaskBest = { summary, outputText, events, density: reaskDensity, missingLiterals };
+  }
+  if (reaskPass || loadedFromOutput) break;
+  if (reaskAttempt >= MAX_REASKS) break;
+  reaskFeedback = [reaskDensity.feedback, buildLiteralReaskFeedback(missingLiterals)]
+    .filter(Boolean)
+    .join("\n\n");
+  process.stderr.write(
+    "reask " +
+      (reaskAttempt + 1) +
+      "/" +
+      MAX_REASKS +
+      (REASK_UNTIL_PASS ? " (until-pass)" : "") +
+      " (density " +
+      JSON.stringify(reaskDensity.metrics) +
+      (missingLiterals.length ? ", missing_literals=" + missingLiterals.length : "") +
+      "): re-requesting with corrective feedback\n"
+  );
+  }
+  summary = reaskBest.summary;
+  outputText = reaskBest.outputText;
+  events = reaskBest.events;
+  if (
+    !loadedFromOutput &&
+    REASK_UNTIL_PASS &&
+    MAX_REASKS > 0 &&
+    (!reaskBest.density.pass || reaskBest.missingLiterals.length > 0)
+  ) {
+    const failure = {
+      ok: false,
+      error: "handoff density/literal gate did not pass after " + MAX_REASKS + " reask(s)",
+      density: reaskBest.density,
+      missing_literals: reaskBest.missingLiterals,
+      thresholds: DENSITY_THRESHOLDS,
+      request: requestMeta,
+    };
+    await writeFile(join(outDir, "failure.json"), JSON.stringify(failure, null, 2) + "\n");
+    console.error(JSON.stringify(failure, null, 2));
+    process.exit(1);
+  }
+  if (!loadedFromOutput && MAX_REASKS > 0) {
+    await writeFile(modelOutputPath, outputText + "\n");
   }
   const legacyModelUserMessagesDiscarded = Object.prototype.hasOwnProperty.call(
     summary,
@@ -4401,12 +5058,12 @@ async function main() {
     provider: PROVIDER,
     endpoint,
     model: MODEL,
-    service_tier: PROVIDER === "codex" ? SERVICE_TIER : null,
-    reasoning: PROVIDER === "codex" ? request.body.reasoning : null,
+    service_tier: PROVIDER_REGISTRY[PROVIDER].family === "codex" ? SERVICE_TIER : null,
+    reasoning: PROVIDER_REGISTRY[PROVIDER].family === "codex" ? request.body.reasoning : null,
     temperature: TEMPERATURE,
-    thinking_level: PROVIDER === "gemini" ? GEMINI_THINKING_LEVEL : null,
+    thinking_level: PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? GEMINI_THINKING_LEVEL : null,
     thinking_config:
-      PROVIDER === "gemini" ? request.body.generationConfig?.thinkingConfig || null : null,
+      PROVIDER_REGISTRY[PROVIDER].family === "gemini" ? request.body.generationConfig?.thinkingConfig || null : null,
     request: requestMeta,
     response_id: adapter.responseId(events),
     usage: adapter.usage(events),
@@ -4416,8 +5073,10 @@ async function main() {
     legacy_model_user_messages_discarded: legacyModelUserMessagesDiscarded,
     legacy_rule_status_defaulted: legacySummaryNormalization.ruleStatusDefaulted,
     legacy_promises_made_defaulted: legacySummaryNormalization.promisesMadeDefaulted,
-    legacy_bullet_format_relaxed: legacySummaryNormalization.bulletFormatRelaxed,
-    legacy_code_block_downgraded: legacySummaryNormalization.codeBlockDowngraded,
+    legacy_bullet_format_relaxed:
+      legacySummaryNormalization.bulletFormatRelaxed + derivedSummaryNormalization.bulletFormatRelaxed,
+    legacy_code_block_downgraded:
+      legacySummaryNormalization.codeBlockDowngraded + derivedSummaryNormalization.codeBlockDowngraded,
     derived_compatibility_arrays_defaulted:
       derivedSummaryNormalization.compatibilityArraysDefaulted.length,
     derived_compatibility_array_keys: derivedSummaryNormalization.compatibilityArraysDefaulted,
@@ -4495,16 +5154,25 @@ async function main() {
   console.log(JSON.stringify(result, null, 2));
 }
 
-main().catch(async (error) => {
-  try {
-    await mkdir(outDir, { recursive: true });
-    await writeFile(
-      join(outDir, "failure.json"),
-      JSON.stringify({ ok: false, error: error.stack || error.message }, null, 2) + "\n"
-    );
-  } catch {
-    // Ignore secondary failure while reporting the primary error.
-  }
-  console.error(JSON.stringify({ ok: false, error: error.message }, null, 2));
-  process.exit(1);
-});
+// Run the CLI only when executed directly (subprocess, redirect, launcher).
+// When imported by a test, argv[1] is the test file, so main() is skipped and
+// the exported internals can be unit-tested without triggering a compaction run.
+const invokedDirectly =
+  Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  main().catch(async (error) => {
+    try {
+      await mkdir(outDir, { recursive: true });
+      await writeFile(
+        join(outDir, "failure.json"),
+        JSON.stringify({ ok: false, error: error.stack || error.message }, null, 2) + "\n"
+      );
+    } catch {
+      // Ignore secondary failure while reporting the primary error.
+    }
+    console.error(JSON.stringify({ ok: false, error: error.message }, null, 2));
+    process.exit(1);
+  });
+}
+
+export { validateSummary, normalizeDerivedSummaryFields, normalizeLegacySummary, relaxSummaryBlockFormats };

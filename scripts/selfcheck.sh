@@ -14,6 +14,8 @@ docs() { for f in README.md SKILL.md AGENTS.md references/*.md "$SC"/*.sh "$SC"/
 
 # 1) syntax
 node --check "$SC/compact-full-transcript.mjs" 2>/dev/null && ok "syntax: node --check" || no "syntax: node --check"
+node --check "$SC/tool-use-format.mjs" 2>/dev/null && ok "syntax: tool-use-format.mjs" || no "syntax: tool-use-format.mjs"
+node "$SC/test-tool-use-format.mjs" >/dev/null 2>&1 && ok "tool-use-format golden tests" || no "tool-use-format golden tests"
 s=0; for f in "$SC"/*.sh; do bash -n "$f" 2>/dev/null || s=1; done
 [ "$s" = 0 ] && ok "syntax: bash -n all shells" || no "syntax: bash -n all shells"
 

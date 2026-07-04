@@ -1,0 +1,78 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openai-ws": {
+      "name": "OpenAI WebSocket",
+      "npm": "@ai-sdk/openai",
+      "api": "https://chatgpt.com/backend-api/codex/responses",
+      "models": {
+        "gpt-5.5": {
+          "name": "GPT 5.5 (WebSocket)",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": false,
+          "tool_call": true,
+          "limit": { "context": 272000, "input": 272000, "output": 128000 },
+          "variants": {
+            "low": { "reasoningEffort": "low", "include": ["reasoning.encrypted_content"] },
+            "medium": { "reasoningEffort": "medium", "include": ["reasoning.encrypted_content"] },
+            "high": { "reasoningEffort": "high", "include": ["reasoning.encrypted_content"] },
+            "xhigh": { "reasoningEffort": "xhigh", "include": ["reasoning.encrypted_content"] }
+          }
+        }
+      }
+    },
+    "zai-coding-plan": {
+      "name": "Z.AI Coding Plan",
+      "npm": "@ai-sdk/openai-compatible",
+      "api": "https://api.z.ai/api/coding/paas/v4",
+      "models": {
+        "glm-5.2": {
+          "name": "GLM 5.2",
+          "reasoning": true,
+          "temperature": false,
+          "attachment": false,
+          "tool_call": true,
+          "limit": { "context": 1000000, "input": 1000000, "output": 131072 }
+        }
+      }
+    }
+  },
+  "agent": {
+    "unifusion-orchestrator": {
+      "description": "Unifusion orchestrator: research strategy, parallel panel dispatch, synthesis, and deliverable output.",
+      "mode": "primary",
+      "model": "amazon-bedrock/global.anthropic.claude-fable-5",
+      "prompt": "{file:./orchestrator_prompt.md}",
+      "tools": { "write": true, "edit": false, "patch": false, "bash": false, "skill": false, "task": true }
+    },
+    "panelist-gpt": {
+      "description": "Unifusion frontier-research panelist backed by GPT-5.5 (Codex).",
+      "mode": "subagent",
+      "model": "openai-ws/gpt-5.5",
+      "prompt": "{file:./architect_prompt.md}",
+      "tools": { "write": false, "edit": false, "patch": false, "bash": false, "skill": false, "task": false }
+    },
+    "panelist-grok": {
+      "description": "Unifusion frontier-research panelist backed by Grok 4.3 on Bedrock Mantle.",
+      "mode": "subagent",
+      "model": "amazon-bedrock/xai.grok-4.3",
+      "prompt": "{file:./architect_prompt.md}",
+      "tools": { "write": false, "edit": false, "patch": false, "bash": false, "skill": false, "task": false }
+    },
+    "panelist-glm": {
+      "description": "Unifusion frontier-research panelist backed by GLM-5.2.",
+      "mode": "subagent",
+      "model": "zai-coding-plan/glm-5.2",
+      "prompt": "{file:./architect_prompt.md}",
+      "tools": { "write": false, "edit": false, "patch": false, "bash": false, "skill": false, "task": false }
+    },
+    "panelist-kimi": {
+      "description": "Unifusion frontier-research panelist backed by Kimi K2.7.",
+      "mode": "subagent",
+      "model": "kimi-for-coding/k2p7",
+      "prompt": "{file:./architect_prompt.md}",
+      "tools": { "write": false, "edit": false, "patch": false, "bash": false, "skill": false, "task": false }
+    }
+  }
+}
